@@ -1,0 +1,4 @@
+# ⚠️ This project has runtime dependencies ON PURPOSE, and that is precisely why it is
+# NOT part of price-watcher. price-watcher is stdlib-only so it still runs after six
+# months untouched; driving a real checkout needs a real browser and cannot be.
+playwright>=1.44

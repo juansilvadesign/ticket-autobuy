@@ -1,0 +1,38 @@
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+
+# ⛔ The browser session. This is a LOGGED-IN BuyTicket session -- possession of this
+# file is possession of the account, including its payment history and any saved data.
+# It is worth strictly more than a password, because it skips the login gate entirely.
+#
+# ⚠️ This project is a git SUBMODULE-shaped sibling of price-watcher and a submodule
+# inherits NO parent .gitignore -- that is exactly how a live cookies.txt once reached
+# a PUBLIC repo in this workspace. The rule is written HERE, in the ignore file that
+# actually governs this tree, and not relied upon from anywhere above it.
+session/
+*.storage_state.json
+cookies.txt
+
+# Secrets: Telegram token, and the BuyTicket credentials if the login path is used.
+.env
+.env.*
+!.env.example
+
+# ⛔ The buyer's personal data: full name, CPF, phone, home address. LGPD-relevant and
+# not ours to publish even in a private repo -- the same call price-watcher makes for
+# subscribers.json. `fields.example.json` documents the keys and IS committed.
+fields.json
+!fields.example.json
+
+# ⛔ Receipts: the whole directory, not a glob. `receipts/*.json` was the original rule
+# and it MISSED the artifact that actually lands here -- `receipts/<target>/pre-order.png`,
+# a full-page screenshot of the checkout with the buyer's name, CPF, phone and address
+# rendered into it. The rule was tested against the shape it was written for instead of
+# the shape on disk. Ignore the directory; nothing in it is ever publishable.
+receipts/
+
+# Checkout recon dumps: full-page screenshots and DOM of a LOGGED-IN session. The
+# screenshots show account details and the JSON can carry prefilled values.
+recon/

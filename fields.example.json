@@ -1,0 +1,13 @@
+{
+  "_comment": "Copy to fields.json (gitignored) and fill with the buyer's real data.",
+  "full_name": "",
+  "email": "",
+  "phone_number": "digits only, with DDD, e.g. 21999999999",
+  "cpf": "digits only, no dots or dash",
+  "cep": "digits only, 8 chars",
+  "uf": "2-letter state code, e.g. RJ",
+  "bairro": "",
+  "municipio": "",
+  "address": "street name only, no number",
+  "number": ""
+}
