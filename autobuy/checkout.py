@@ -595,7 +595,8 @@ def _pending_rows(page) -> list:
 
 
 def _pix_from_orders_page(page, *, timeout_ms: int = 45_000,
-                          max_orders: int = 3) -> dict:
+                          max_orders: int = 3,
+                          button_timeout_ms: int = 12_000) -> dict:
     """Navigate to the ORDER and read its code.
 
     ⭐ THE correction from three real runs. Clicking the final "Comprar agora" does NOT
@@ -634,7 +635,7 @@ def _pix_from_orders_page(page, *, timeout_ms: int = 45_000,
             # A shorter budget per candidate: a lapsed order will never grow the button,
             # and spending the full 45 s on each would blow the 10-minute hold.
             if _wait_for(page, lambda pg: pg.locator(PIX_COPY_BUTTON).count(),
-                         timeout_ms=12_000) is None:
+                         timeout_ms=button_timeout_ms) is None:
                 continue
             got = _extract_pix(page)
             if got:

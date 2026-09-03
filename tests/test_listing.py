@@ -461,7 +461,7 @@ def test_a_stale_pending_hold_does_not_shadow_this_runs_order(monkeypatch):
                         lambda pg, text, limit=12: next(
                             (m for m in pg.get_by_text(text).all() if m.is_visible()), None))
     page = _FakeOrdersList(payable_index=1)
-    got = checkout._pix_from_orders_page(page, timeout_ms=300)
+    got = checkout._pix_from_orders_page(page, timeout_ms=300, button_timeout_ms=200)
     assert got["pix_code"] == _REAL_PIX
     assert page.opened == 1, "must have moved past the stale first row"
     assert got["order_url"].endswith("order1")
@@ -475,4 +475,5 @@ def test_no_payable_order_anywhere_returns_empty(monkeypatch):
                         lambda pg, text, limit=12: next(
                             (m for m in pg.get_by_text(text).all() if m.is_visible()), None))
     assert checkout._pix_from_orders_page(
-        _FakeOrdersList(payable_index=99), timeout_ms=300) == {}
+        _FakeOrdersList(payable_index=99), timeout_ms=300,
+        button_timeout_ms=200) == {}
