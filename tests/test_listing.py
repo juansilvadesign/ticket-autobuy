@@ -417,3 +417,62 @@ def test_wait_for_returns_none_rather_than_hanging():
         def wait_for_timeout(self, _ms): calls["n"] += 1
     assert checkout._wait_for(_P(), lambda pg: False, timeout_ms=300, poll_ms=50) is None
     assert calls["n"] > 0
+
+
+class _FakeOrdersList:
+    """Comprados with TWO pending rows: a stale hold from an earlier run that sorts
+    first and has no copy button, then this run's order, which has one."""
+    def __init__(self, payable_index=1):
+        self.url, self.payable_index = "https://buyticketbrasil.com/checkout?p=2", payable_index
+        self.opened, self.n_pending = None, 2
+    def goto(self, url, **k): self.url, self.opened = url, None
+    def wait_for_timeout(self, _ms): pass
+    def inner_text(self, _sel): return "Comprados Aguardando pagamento"
+    def locator(self, sel):
+        payable = self.opened == self.payable_index
+        return _FakeLocator(present=(sel == "#btn_copy" and payable))
+    def evaluate(self, js, arg=None):
+        if "readText" in js:
+            return _REAL_PIX if self.opened == self.payable_index else ""
+        return None
+    def get_by_text(self, text, **k):
+        page = self
+        class _Row:
+            def __init__(self, i): self.i = i
+            def is_visible(self): return True
+            def click(self):
+                if text == "Aguardando pagamento":
+                    page.opened = self.i
+                    page.url = f"https://buyticketbrasil.com/ingressos?ID=order{self.i}"
+        class _L:
+            def all(self):
+                return [_Row(i) for i in range(page.n_pending)] \
+                    if text == "Aguardando pagamento" else [_Row(0)]
+        return _L()
+
+
+def test_a_stale_pending_hold_does_not_shadow_this_runs_order(monkeypatch):
+    """⛔ THE third-run bug. A hold from an earlier run that has not lapsed yet still
+    reads 'Aguardando pagamento' and sorts ahead of an order the site has not finished
+    publishing. Opening it finds no #btn_copy, and the tool reported 'no Pix code' over
+    a checkout that had gone through. It must try the NEXT pending order, not give up."""
+    monkeypatch.setattr(checkout, "_goto", lambda pg, url, **k: pg.goto(url))
+    monkeypatch.setattr(checkout, "_first_visible",
+                        lambda pg, text, limit=12: next(
+                            (m for m in pg.get_by_text(text).all() if m.is_visible()), None))
+    page = _FakeOrdersList(payable_index=1)
+    got = checkout._pix_from_orders_page(page, timeout_ms=300)
+    assert got["pix_code"] == _REAL_PIX
+    assert page.opened == 1, "must have moved past the stale first row"
+    assert got["order_url"].endswith("order1")
+
+
+def test_no_payable_order_anywhere_returns_empty(monkeypatch):
+    """Every pending row unreadable => {} => the caller raises loudly. ⛔ Never a
+    silent success, which would drop a real reservation on the floor."""
+    monkeypatch.setattr(checkout, "_goto", lambda pg, url, **k: pg.goto(url))
+    monkeypatch.setattr(checkout, "_first_visible",
+                        lambda pg, text, limit=12: next(
+                            (m for m in pg.get_by_text(text).all() if m.is_visible()), None))
+    assert checkout._pix_from_orders_page(
+        _FakeOrdersList(payable_index=99), timeout_ms=300) == {}
