@@ -274,7 +274,12 @@ def open_listing(playwright, listing_url: str, *, headless: bool = True,
     """
     state = session_mod.require(session_path)
     browser = playwright.chromium.launch(headless=headless)
-    context = browser.new_context(storage_state=str(state))
+    # ⚠️ `clipboard-read` is REQUIRED, not a nicety: the Pix payload is only ever
+    # written to the clipboard (see `_pix_from_clipboard`). Granted here, at context
+    # creation, because a permission discovered to be missing at the payment step is
+    # discovered on the one screen where the order already exists.
+    context = browser.new_context(storage_state=str(state),
+                                  permissions=["clipboard-read", "clipboard-write"])
     page = context.new_page()
     _goto(page, listing_url)
     page.wait_for_timeout(2000)                    # the app re-renders after navigation
@@ -516,32 +521,77 @@ def _page_price_cents(page) -> int | None:
     return int(m.group(1).replace(".", "")) * 100 + int(m.group(2))
 
 
+#: The order screen's copy button, verified live on a real order (#7707X57Q) 2026-09-02.
+PIX_COPY_BUTTON = "#btn_copy"
+
+#: Where an order can be found AFTER the fact. ⛔ Not the checkout URL: reopening that
+#: starts a FRESH checkout showing no order, which reads as "nothing was reserved" when
+#: a real reservation exists. That mistake was made, live, on the night this was written.
+ORDERS_URL = "https://buyticketbrasil.com/ingressos"
+
+
+def _looks_like_pix(val: str) -> bool:
+    """A Pix EMV payload opens with the payload-format tag `0002`. Length is checked too
+    because the page carries long Bubble record ids that also begin with digits."""
+    return bool(val) and val.strip().startswith("0002") and len(val.strip()) > 40
+
+
+def _pix_from_clipboard(page) -> dict:
+    """Click "Copiar código" and read what it wrote to the clipboard.
+
+    ⚠️ Two traps, both hit live on 2026-09-02 and neither guessable from the DOM:
+
+    1. A `<div class="greyout ...">` sits above the button, so Playwright's `.click()`
+       waits for actionability and times out after 30 s against a button it has just
+       reported "visible, enabled and stable". `HTMLElement.click()` via `evaluate`
+       dispatches the handler directly and is not subject to pointer interception.
+    2. The context must hold `clipboard-read` or `readText()` rejects -- returning
+       nothing, indistinguishably from "there was no code". `open_listing` grants it.
+    """
+    for sel in (PIX_COPY_BUTTON, "button:has-text('Copiar')"):
+        try:
+            if not page.locator(sel).count():
+                continue
+            page.evaluate("sel => document.querySelector(sel)?.click()", sel)
+            page.wait_for_timeout(600)
+            val = (page.evaluate("navigator.clipboard.readText()") or "").strip()
+            if _looks_like_pix(val):
+                return {"pix_code": val, "source": f"clipboard via {sel}"}
+        except Exception:                                  # noqa: BLE001
+            continue
+    return {}
+
+
 def _extract_pix(page) -> dict:
     """The Pix copia-e-cola and, if present, the QR image.
 
-    ⚠️ This is the ONE leg of the flow that could not be mapped: the screen only exists
-    once an order has been created, and creating one to look at it is the exact thing
-    this tool must not do speculatively. So it reads several shapes rather than the one
-    a recon would have pinned -- an input's value, a textarea, and the page text -- and
-    the caller RAISES if none matched, because a reservation that exists while its code
-    was not captured is the worst state this tool can leave behind.
+    ⭐ VERIFIED 2026-09-02 against a real order, which overturned this function's whole
+    premise. It was written blind against three plausible shapes -- a readonly input, a
+    textarea, and the page text -- and **all three were wrong**. The payload is not in
+    the DOM at any point: the order screen renders the literal words "Código Pix" beside
+    a `Copiar código` button, and the code exists only on the clipboard that button
+    writes. The three DOM shapes are kept below because they cost nothing and a redesign
+    may yet expose one, but the clipboard is the path that works.
+
+    The caller still RAISES when every path comes back empty, because a reservation that
+    exists while its code was not captured is the worst state this tool can leave behind.
     """
     for sel in ("input[readonly]", "textarea", "input[type=text]"):
         try:
             loc = page.locator(sel)
             for i in range(min(loc.count(), 10)):
                 val = (loc.nth(i).input_value() or "").strip()
-                if val.startswith("0002") and len(val) > 40:
+                if _looks_like_pix(val):
                     return {"pix_code": val, "source": f"{sel}[{i}]"}
         except Exception:                                  # noqa: BLE001
             continue
     try:
         m = PIX_CODE_RE.search(page.inner_text("body") or "")
-        if m:
+        if m and _looks_like_pix(m.group(0)):
             return {"pix_code": m.group(0).strip(), "source": "body-text"}
     except Exception:                                      # noqa: BLE001
         pass
-    return {}
+    return _pix_from_clipboard(page)
 
 
 def run_checkout(page, person: Person, *, dry_run: bool = True,
@@ -637,9 +687,14 @@ def run_checkout(page, person: Person, *, dry_run: bool = True,
         # ⛔ Never retried and never swallowed. A retry would risk a SECOND reservation,
         # and a swallow would leave a real, paid-for-able order with no code to pay it.
         raise CheckoutError(
-            f"AN ORDER MAY EXIST at {page.url} but no Pix code could be read.\n"
-            f"⚠️ Open that URL in your browser NOW and pay it by hand -- the hold is "
-            f"~30 minutes. A screenshot is in {out_dir or '(no out_dir given)'}.\n"
+            f"AN ORDER MAY EXIST but no Pix code could be read.\n"
+            f"⚠️ Find it at {ORDERS_URL} -> the 'Comprados' tab, open the order and "
+            f"press 'Copiar código'.\n"
+            f"⛔ NOT at {page.url} -- reopening a checkout URL starts a FRESH checkout "
+            f"and shows no order, which reads as 'nothing was reserved' while a real "
+            f"reservation is running down its clock.\n"
+            f"⏰ The hold is ~10 MINUTES from the order, not 30.\n"
+            f"A screenshot is in {out_dir or '(no out_dir given)'}.\n"
             f"⛔ Do not re-run this command; it would reserve a second ticket.")
 
     qr = None

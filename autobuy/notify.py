@@ -1,8 +1,10 @@
 """Hand the Pix payload to a human, fast.
 
 This is the single most consequential module in the tool. The bot reserves a ticket and
-the site holds it for ~30 minutes; if the Pix code does not reach Juan inside that
-window the reservation lapses and the ticket returns to sale. A notifier that fails
+the site holds it for ⏰ ~10 MINUTES -- measured on the first real order, not the 30
+this file assumed -- and if the Pix code does not reach Juan inside that window the
+reservation lapses and the ticket returns to sale. A third of the assumed margin is the
+difference between "he'll see it" and a lapsed hold. A notifier that fails
 quietly here does not degrade the feature -- it deletes it, while leaving a log that
 says the purchase succeeded.
 
@@ -86,7 +88,7 @@ def _call(token: str, method: str, params: dict) -> dict:
 # Plain text costs nothing here and cannot be broken by a third-party string.
 def send_pix(token: str, chat_id: str, *, label: str, item: str, price_brl: str,
              pix_code: str, qr_png: Path | None = None,
-             expires_note: str = "~30 min") -> None:
+             expires_note: str = "~10 min") -> None:
     """Print the Pix payload, then deliver it. Raises `NotifyError` if it did not land."""
     text = (
         f"🎟  RESERVED — pay to confirm\n"
