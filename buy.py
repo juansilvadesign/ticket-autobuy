@@ -5,6 +5,7 @@
     python buy.py resolve --target <file>        read the market, print what would be bought
     python buy.py map     --target <file>        walk the checkout, dump selectors, NEVER buy
     python buy.py buy     --target <file>        reserve + send the Pix code
+    python buy.py autobuy                        cron: buy once per night on a dip
 
 Exit codes, matching price-watcher's grammar:
     0  ok / nothing matched
@@ -29,7 +30,8 @@ HERE = Path(__file__).resolve().parent
 BUDGET_S = 60.0
 sys.path.insert(0, str(HERE))
 
-from autobuy import checkout, config, listing, notify, session, timing  # noqa: E402
+from autobuy import (checkout, config, listing, notify, runner,        # noqa: E402
+                     session, timing)
 from autobuy.errors import (AutobuyError, CheckoutError, ConfigError,   # noqa: E402
                             NoMatch, ResolveError, SessionError)
 
@@ -128,38 +130,47 @@ def cmd_map(args) -> int:
     return 0
 
 
-def cmd_buy(args) -> int:
+def _execute_buy(cfg, *, fields, headed: bool = False, dry_run: bool = False,
+                 clock=None):
+    """The one purchase path. `buy` and `autobuy` MUST share it -- two copies would
+    drift, and the copy that drifts is the one that spends money unattended."""
     from playwright.sync_api import sync_playwright
-    # ⏱ The clock starts on the FIRST line of work, not at the browser. The question
+    person = checkout.Person.load(fields)
+    session.require()                  # fail at startup, not at the payment screen
+    if clock is not None:
+        clock.mark("config + session")
+    best, _ = _resolve(cfg)            # ⚠️ LIVE re-resolve: the authority, not history
+    if clock is not None:
+        clock.mark("resolve market")
+    url = best.url(cfg.event_slug)
+    print(f"\u2192 {best.item} at {_fmt_brl(best.price_cents)}\n  {url}", flush=True)
+
+    with sync_playwright() as p:
+        browser, _, page = checkout.open_listing(p, url, headless=not headed)
+        if clock is not None:
+            clock.mark("browser + listing")
+        try:
+            result = checkout.run_checkout(
+                page, person, dry_run=dry_run, expect_cents=best.price_cents,
+                out_dir=HERE / "receipts" / cfg.target_id, clock=clock)
+        finally:
+            browser.close()
+    return best, result
+
+
+def cmd_buy(args) -> int:
+    # \u23f1 The clock starts on the FIRST line of work, not at the browser. The question
     # this tool exists to answer is "alert -> payable code"; config parsing and the RSC
     # read are inside that budget whether or not they are the interesting part.
     clock = timing.Clock(f"buy {Path(args.target).stem}")
     try:
         cfg = config.load(args.target)
-        person = checkout.Person.load(args.fields)
-        session.require()              # fail at startup, not at the payment screen
-        clock.mark("config + session")
-        best, _ = _resolve(cfg)
-        clock.mark("resolve market")
-        url = best.url(cfg.event_slug)
-        print(f"\u2192 {best.item} at {_fmt_brl(best.price_cents)}\n  {url}")
-
-        with sync_playwright() as p:
-            browser, _, page = checkout.open_listing(p, url, headless=not args.headed)
-            clock.mark("browser + listing")
-            try:
-                result = checkout.run_checkout(
-                    page, person, dry_run=args.dry_run,
-                    expect_cents=best.price_cents,
-                    out_dir=HERE / "receipts" / cfg.target_id, clock=clock)
-            finally:
-                browser.close()
-
+        best, result = _execute_buy(cfg, fields=args.fields, headed=args.headed,
+                                    dry_run=args.dry_run, clock=clock)
         if result.get("dry_run"):
             print(f"\n\u2705 dry run: stopped one click short of 'Comprar agora'. "
                   f"Nothing was ordered.\n   {result}")
             return 0
-
         notify.send_pix(
             os.environ.get("TELEGRAM_BOT_TOKEN", ""),
             os.environ.get("TELEGRAM_CHAT_ID", ""),
@@ -172,6 +183,109 @@ def cmd_buy(args) -> int:
         # \u26d4 In `finally`: an abort is exactly when the breakdown matters most, and a
         # report that prints only on success cannot explain a run that ran out of time.
         print("\n" + clock.report(budget_s=BUDGET_S), flush=True)
+
+
+def cmd_autobuy(args) -> int:
+    """Cron entry point. At most ONE reservation per invocation, one per night ever."""
+    from datetime import datetime, timezone
+
+    lock = runner.acquire_lock()
+    if lock is None:
+        # A previous invocation is still mid-purchase. ~40s of work on a 1-minute cron
+        # WILL overlap; two runs seeing one dip is how one ticket becomes two.
+        if args.verbose:
+            print("another autobuy run holds the lock; skipping")
+        return 0
+    try:
+        now = runner.now_local()
+        if not runner.within_window(now):
+            if args.verbose:
+                print(f"outside the buy window at {now:%H:%M} {now.tzname()}; skipping")
+            return 0
+
+        # ⛔ ONCE per run, from the poller itself -- never from a history file's age.
+        # Those are change logs: a stable market writes nothing, so an age check over
+        # them would call a steady R$150 dip "blind" and skip the very thing we want.
+        runner.assert_poller_alive(Path(args.history))
+
+        state = runner._read_state()
+        blind: list[str] = []
+        for tpath in sorted(Path(args.targets).glob("*.json")):
+            try:
+                cfg = config.load(tpath)          # armed targets only
+            except ConfigError:
+                continue                          # disarmed or no buy block: not an error
+            if runner.already_fired(state, cfg.target_id):
+                continue
+            hist = Path(args.history) / f"{cfg.target_id}.jsonl"
+            try:
+                readings = runner.latest_readings(
+                    hist, now=datetime.now(timezone.utc))
+            except AutobuyError as e:
+                # A missing or unreadable file for an ARMED target. Not "no dip" --
+                # we cannot see this night at all, and that must be said out loud.
+                blind.append(str(e))
+                continue
+            hit = runner.candidate_under_ceiling(readings, cfg)
+            if hit is None:
+                continue
+
+            # ⛔ A dead session is the failure that silently DELETES this feature: the
+            # session observed on 2026-09-02 lasted under 4 hours, and without an alert
+            # the cron would go on running, finding dips, and failing to buy any of them
+            # into a log nobody reads. Checked here, before the browser, so the message
+            # says "re-login" rather than arriving as a checkout stack trace.
+            try:
+                session.require()
+            except SessionError as e:
+                if runner.should_alert(state, "session_dead"):
+                    runner._write_state(state)
+                    notify.send_text(
+                        os.environ.get("TELEGRAM_BOT_TOKEN", ""),
+                        os.environ.get("TELEGRAM_CHAT_ID", ""),
+                        f"\U0001f534 ticket-autobuy is BLIND\n\n{cfg.label} dipped to "
+                        f"{_fmt_brl(hit['price_cents'])} and it could NOT buy: the "
+                        f"BuyTicket session is dead.\n\nRun:  python buy.py login\n\n"
+                        f"Nothing is being bought on any night until you do.")
+                raise
+
+            print(f"\u2193 {cfg.label}: {hit['item']} at "
+                  f"{_fmt_brl(hit['price_cents'])} <= ceiling "
+                  f"{_fmt_brl(cfg.max_price_cents)} -- buying", flush=True)
+            clock = timing.Clock(f"autobuy {cfg.target_id}")
+            try:
+                best, result = _execute_buy(cfg, fields=args.fields, clock=clock)
+            except NoMatch:
+                # The dip evaporated between price-watcher's read and ours. The single
+                # most likely outcome on a fast market, and an ordinary no-op.
+                print("   gone before we got there; nothing ordered", flush=True)
+                continue
+            finally:
+                print("\n" + clock.report(budget_s=BUDGET_S), flush=True)
+
+            # ⛔ Record BEFORE notifying. A delivery failure must never leave a real
+            # reservation absent from the ledger -- that is how the next cron minute
+            # buys a second ticket for the same night.
+            state = runner.record_fired(
+                state, cfg.target_id, price_cents=best.price_cents,
+                item=best.item, order_url=result.get("order_url"))
+            runner._write_state(state)
+            runner.disarm_target(tpath)
+
+            notify.send_pix(
+                os.environ.get("TELEGRAM_BOT_TOKEN", ""),
+                os.environ.get("TELEGRAM_CHAT_ID", ""),
+                label=cfg.label, item=best.item,
+                price_brl=_fmt_brl(best.price_cents),
+                pix_code=result["pix_code"], qr_png=result.get("qr_png"),
+            )
+            return 0                              # one reservation per invocation
+
+        if blind:
+            raise AutobuyError("; ".join(blind))
+        return 0
+    finally:
+        lock.close()
 
 
 def main(argv=None) -> int:
@@ -205,6 +319,22 @@ def main(argv=None) -> int:
         "--headless", action="store_true",
         help="map with no visible window -- use it to prove the headless path works "
              "before relying on it for an unattended buy")
+
+    PW = HERE.parent / "price-watcher"
+    ab = sub.add_parser("autobuy",
+                        help="cron entry point: buy once per night when it dips")
+    ab.set_defaults(fn=cmd_autobuy)
+    ab.add_argument("--targets", default=str(PW / "targets"),
+                    help="price-watcher targets directory")
+    ab.add_argument("--history", default=str(PW / "history"),
+                    help="price-watcher history directory -- the TRIGGER source. Using "
+                         "it costs zero extra requests to the site; a second poller "
+                         "would nearly double the request budget.")
+    ab.add_argument("--fields", default=str(HERE / "fields.json"),
+                    help="buyer personal data (gitignored)")
+    ab.add_argument("--verbose", "-v", action="store_true",
+                    help="say why nothing happened -- without it a skipped run is silent, "
+                         "which is correct for cron and useless when you are debugging")
 
     buy_p = sub.choices["buy"]
     buy_p.add_argument("--fields", default=str(HERE / "fields.json"),
