@@ -562,6 +562,67 @@ def _pix_from_clipboard(page) -> dict:
     return {}
 
 
+def _wait_for(page, predicate, *, timeout_ms: int = 45_000, poll_ms: int = 250):
+    """Poll until `predicate(page)` returns truthy, or the deadline passes.
+
+    ⛔ Not a fixed sleep, and deliberately not `settle()`. `settle` returns as soon as
+    ANY actionable control exists, and the post-order page is full of them (Voltar, the
+    help links) while the Pix section is still rendering. A gate that generic is why the
+    first two real orders were read too early and reported as failures.
+    """
+    deadline = time.monotonic() + timeout_ms / 1000
+    while time.monotonic() < deadline:
+        try:
+            got = predicate(page)
+            if got:
+                return got
+        except Exception:                                  # noqa: BLE001
+            pass                                           # mid-navigation; keep polling
+        page.wait_for_timeout(poll_ms)
+    return None
+
+
+def _pix_from_orders_page(page, *, timeout_ms: int = 45_000) -> dict:
+    """Navigate to the ORDER and read its code.
+
+    ⭐ THE correction from two real purchases (#7707X57Q, #1280BPGN). Clicking the final
+    "Comprar agora" does NOT turn the checkout into a Pix screen: the page keeps its
+    `/checkout?...&p=2` URL, shows an "Aguarde…" spinner, and never renders a code at
+    all. Waiting longer does not help, because the code was never coming to that page.
+
+    It lives on the order, at `/ingressos` -> **Comprados** -> the pending order, where
+    `#btn_copy` appears within ~0.04 s of the row being opened. That is where a human
+    goes, and it is the only place the payload has ever been observed.
+
+    ⛔ Read-only: this navigates and clicks account UI. It cannot create an order.
+    """
+    try:
+        _goto(page, ORDERS_URL)
+        tab = _wait_for(page, lambda pg: _first_visible(pg, "Comprados"),
+                        timeout_ms=timeout_ms)
+        if tab is None:
+            return {}
+        tab.click()
+        row = _wait_for(page, lambda pg: _first_visible(pg, "Aguardando pagamento"),
+                        timeout_ms=timeout_ms)
+        if row is None:
+            return {}
+        row.click()
+        # ⚠️ Takes the FIRST pending order. The list is newest-first and the tool holds
+        # one reservation per run, so that is this run's order -- but if a previous hold
+        # is still unpaid it would be picked instead, which is why the caller prints the
+        # order URL for a human to confirm rather than treating it as certain.
+        if _wait_for(page, lambda pg: pg.locator(PIX_COPY_BUTTON).count(),
+                     timeout_ms=timeout_ms) is None:
+            return {}
+        got = _extract_pix(page)
+        if got:
+            got["order_url"] = page.url
+        return got
+    except Exception:                                      # noqa: BLE001
+        return {}
+
+
 def _extract_pix(page) -> dict:
     """The Pix copia-e-cola and, if present, the QR image.
 
@@ -596,7 +657,7 @@ def _extract_pix(page) -> dict:
 
 def run_checkout(page, person: Person, *, dry_run: bool = True,
                  expect_cents: int | None = None,
-                 out_dir: Path | None = None) -> dict:
+                 out_dir: Path | None = None, clock=None) -> dict:
     """Drive the checkout to a Pix payload. ⛔ Reserves; never pays.
 
     Written from the map of 2026-09-02, which walked all five screens live:
@@ -616,6 +677,8 @@ def run_checkout(page, person: Person, *, dry_run: bool = True,
 
     for step in range(1, 9):
         elements = settle(page)
+        if clock is not None:
+            clock.mark(f"screen {step} rendered")
         if not any(_actionable(e) for e in elements):
             raise CheckoutError(f"step {step}: nothing rendered after 90s at {page.url}")
 
@@ -677,12 +740,21 @@ def run_checkout(page, person: Person, *, dry_run: bool = True,
         raise CheckoutError("checkout did not reach a final control in 8 screens")
 
     # ── an order now exists; capturing its code is the only thing that matters ──────
+    if clock is not None:
+        clock.mark("ORDER CREATED (final click)")
     page.wait_for_timeout(4000)
     settle(page, timeout_ms=120_000)
+    if clock is not None:
+        clock.mark("order screen settled")
     if out_dir:
         page.screenshot(path=str(out_dir / "order.png"), full_page=True)
 
     pix = _extract_pix(page)
+    if not pix:
+        # The checkout page never becomes the Pix screen -- go to the order itself.
+        pix = _pix_from_orders_page(page)
+    if clock is not None:
+        clock.mark("PIX CODE EXTRACTED")
     if not pix:
         # ⛔ Never retried and never swallowed. A retry would risk a SECOND reservation,
         # and a swallow would leave a real, paid-for-able order with no code to pay it.
@@ -707,4 +779,5 @@ def run_checkout(page, person: Person, *, dry_run: bool = True,
         except Exception:                                  # noqa: BLE001
             qr = None
     return {"dry_run": False, "pix_code": pix["pix_code"], "qr_png": qr,
-            "price_cents": _page_price_cents(page), "url": page.url}
+            "source": pix.get("source"),
+            "order_url": pix.get("order_url") or page.url, "url": page.url}
