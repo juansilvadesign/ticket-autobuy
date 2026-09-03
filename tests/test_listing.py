@@ -360,3 +360,60 @@ def test_recovery_message_points_at_the_orders_page_not_the_checkout_url():
     src = (ROOT / "autobuy" / "checkout.py").read_text(encoding="utf-8")
     assert "ORDERS_URL" in src and "/ingressos" in checkout.ORDERS_URL
     assert "Comprados" in src and "~10 MINUTES" in src
+
+
+class _FakeCheckoutThenOrders:
+    """Models the REAL post-click behaviour: the checkout page keeps its URL, shows an
+    "Aguarde…" spinner and NEVER renders a code; the code is on the order page."""
+    def __init__(self):
+        self.url = "https://buyticketbrasil.com/checkout?anuncio=x&p=2"
+        self.clicked, self.on_orders = [], False
+    # -- page API used by the fallback --
+    def goto(self, url, **k): self.url = url; self.on_orders = True
+    def wait_for_timeout(self, _ms): pass
+    def inner_text(self, _sel):
+        return ("Aguarde..." if not self.on_orders
+                else "Comprados Aguardando pagamento Código Pix Copiar código")
+    def locator(self, sel):
+        if sel == "#btn_copy":
+            return _FakeLocator(present=self.on_orders)
+        return _FakeLocator(present=False)
+    def evaluate(self, js, arg=None):
+        if "readText" in js: return _REAL_PIX if self.on_orders else ""
+        return None
+    def get_by_text(self, text, **k):
+        page = self
+        class _M:
+            def __init__(self, t): self.t = t
+            def is_visible(self): return page.on_orders or self.t == "Comprados"
+            def click(self): page.clicked.append(self.t); page.on_orders = True
+        class _L:
+            def all(self): return [_M(text)]
+        return _L()
+
+
+def test_the_code_is_fetched_from_the_orders_page_not_the_checkout(monkeypatch):
+    """⭐ THE correction from two real orders (#7707X57Q, #1280BPGN). Clicking the final
+    'Comprar agora' does NOT turn the checkout into a Pix screen -- it keeps its URL and
+    sits on 'Aguarde…'. Waiting longer never helps: the code was never coming to that
+    page. It is on /ingressos -> Comprados -> the pending order."""
+    monkeypatch.setattr(checkout, "_goto", lambda pg, url, **k: pg.goto(url))
+    monkeypatch.setattr(checkout, "_first_visible",
+                        lambda pg, text, limit=12: next(
+                            (m for m in pg.get_by_text(text).all() if m.is_visible()), None))
+    page = _FakeCheckoutThenOrders()
+    assert checkout._extract_pix(page) == {}, "the checkout page carries no code"
+    got = checkout._pix_from_orders_page(page)
+    assert got["pix_code"] == _REAL_PIX
+    assert "Comprados" in page.clicked
+    assert got["order_url"].endswith("/ingressos")
+
+
+def test_wait_for_returns_none_rather_than_hanging():
+    """A predicate that never fires must time out and return None, so the caller reports
+    'no code' loudly instead of blocking past the 10-minute hold."""
+    calls = {"n": 0}
+    class _P:
+        def wait_for_timeout(self, _ms): calls["n"] += 1
+    assert checkout._wait_for(_P(), lambda pg: False, timeout_ms=300, poll_ms=50) is None
+    assert calls["n"] > 0
