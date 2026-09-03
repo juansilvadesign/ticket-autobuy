@@ -582,45 +582,67 @@ def _wait_for(page, predicate, *, timeout_ms: int = 45_000, poll_ms: int = 250):
     return None
 
 
-def _pix_from_orders_page(page, *, timeout_ms: int = 45_000) -> dict:
+def _pending_rows(page) -> list:
+    """Every visible "Aguardando pagamento" row in Comprados, newest first."""
+    out = []
+    try:
+        for el in page.get_by_text("Aguardando pagamento", exact=False).all():
+            if el.is_visible():
+                out.append(el)
+    except Exception:                                      # noqa: BLE001
+        return []
+    return out
+
+
+def _pix_from_orders_page(page, *, timeout_ms: int = 45_000,
+                          max_orders: int = 3) -> dict:
     """Navigate to the ORDER and read its code.
 
-    ⭐ THE correction from two real purchases (#7707X57Q, #1280BPGN). Clicking the final
-    "Comprar agora" does NOT turn the checkout into a Pix screen: the page keeps its
-    `/checkout?...&p=2` URL, shows an "Aguarde…" spinner, and never renders a code at
-    all. Waiting longer does not help, because the code was never coming to that page.
+    ⭐ THE correction from three real runs. Clicking the final "Comprar agora" does NOT
+    turn the checkout into a Pix screen: the page keeps its `/checkout?...&p=2` URL,
+    shows "Aguarde…", and never renders a code. Waiting longer never helps -- the code
+    was never coming to that page. It is on the order, at `/ingressos` -> **Comprados**,
+    where `#btn_copy` appears within ~0.04 s of the row being opened.
 
-    It lives on the order, at `/ingressos` -> **Comprados** -> the pending order, where
-    `#btn_copy` appears within ~0.04 s of the row being opened. That is where a human
-    goes, and it is the only place the payload has ever been observed.
+    ⛔ And the first pending row is NOT necessarily this run's order. A hold from an
+    earlier run that has not lapsed yet still reads "Aguardando pagamento" and sorts
+    ahead of an order the site has not finished publishing -- which is exactly what
+    happened on the third run: the fallback opened a stale order, found no copy button,
+    and reported "no Pix code" over a checkout that had gone through.
 
-    ⛔ Read-only: this navigates and clicks account UI. It cannot create an order.
+    So it does not guess which row is ours: it tries each pending order and returns the
+    first that actually yields a payload. A lapsed or unpayable hold has no `#btn_copy`
+    and is skipped. The caller reports `order_url` so a human confirms WHICH order was
+    read, because "the one that had a code" is a heuristic, not an identity.
+
+    ⛔ Read-only: it navigates and clicks account UI. It cannot create an order.
     """
-    try:
-        _goto(page, ORDERS_URL)
-        tab = _wait_for(page, lambda pg: _first_visible(pg, "Comprados"),
-                        timeout_ms=timeout_ms)
-        if tab is None:
-            return {}
-        tab.click()
-        row = _wait_for(page, lambda pg: _first_visible(pg, "Aguardando pagamento"),
-                        timeout_ms=timeout_ms)
-        if row is None:
-            return {}
-        row.click()
-        # ⚠️ Takes the FIRST pending order. The list is newest-first and the tool holds
-        # one reservation per run, so that is this run's order -- but if a previous hold
-        # is still unpaid it would be picked instead, which is why the caller prints the
-        # order URL for a human to confirm rather than treating it as certain.
-        if _wait_for(page, lambda pg: pg.locator(PIX_COPY_BUTTON).count(),
-                     timeout_ms=timeout_ms) is None:
-            return {}
-        got = _extract_pix(page)
-        if got:
-            got["order_url"] = page.url
-        return got
-    except Exception:                                      # noqa: BLE001
-        return {}
+    for idx in range(max_orders):
+        try:
+            _goto(page, ORDERS_URL)
+            tab = _wait_for(page, lambda pg: _first_visible(pg, "Comprados"),
+                            timeout_ms=timeout_ms)
+            if tab is None:
+                return {}
+            tab.click()
+            rows = _wait_for(page, _pending_rows, timeout_ms=timeout_ms)
+            if not rows:
+                return {}                      # nothing pending at all -- no order
+            if idx >= len(rows):
+                return {}                      # exhausted the pending orders
+            rows[idx].click()
+            # A shorter budget per candidate: a lapsed order will never grow the button,
+            # and spending the full 45 s on each would blow the 10-minute hold.
+            if _wait_for(page, lambda pg: pg.locator(PIX_COPY_BUTTON).count(),
+                         timeout_ms=12_000) is None:
+                continue
+            got = _extract_pix(page)
+            if got:
+                got["order_url"] = page.url
+                return got
+        except Exception:                                  # noqa: BLE001
+            continue
+    return {}
 
 
 def _extract_pix(page) -> dict:
