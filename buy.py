@@ -21,9 +21,15 @@ import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+
+#: The human benchmark this tool has to beat. Juan does the whole manual flow -- see the
+#: alert, open the listing, fill the checkout, copy the Pix -- in about 60 s, and on a hot
+#: listing the row is gone inside that. Anything slower is a tool that reliably produces a
+#: correct answer about a ticket somebody else already bought.
+BUDGET_S = 60.0
 sys.path.insert(0, str(HERE))
 
-from autobuy import checkout, config, listing, notify, session          # noqa: E402
+from autobuy import checkout, config, listing, notify, session, timing  # noqa: E402
 from autobuy.errors import (AutobuyError, CheckoutError, ConfigError,   # noqa: E402
                             NoMatch, ResolveError, SessionError)
 
@@ -124,36 +130,48 @@ def cmd_map(args) -> int:
 
 def cmd_buy(args) -> int:
     from playwright.sync_api import sync_playwright
-    cfg = config.load(args.target)
-    person = checkout.Person.load(args.fields)
-    session.require()                  # fail at startup, not at the payment screen
-    best, _ = _resolve(cfg)
-    url = best.url(cfg.event_slug)
-    print(f"→ {best.item} at {_fmt_brl(best.price_cents)}\n  {url}")
+    # ⏱ The clock starts on the FIRST line of work, not at the browser. The question
+    # this tool exists to answer is "alert -> payable code"; config parsing and the RSC
+    # read are inside that budget whether or not they are the interesting part.
+    clock = timing.Clock(f"buy {Path(args.target).stem}")
+    try:
+        cfg = config.load(args.target)
+        person = checkout.Person.load(args.fields)
+        session.require()              # fail at startup, not at the payment screen
+        clock.mark("config + session")
+        best, _ = _resolve(cfg)
+        clock.mark("resolve market")
+        url = best.url(cfg.event_slug)
+        print(f"\u2192 {best.item} at {_fmt_brl(best.price_cents)}\n  {url}")
 
-    with sync_playwright() as p:
-        browser, _, page = checkout.open_listing(p, url, headless=not args.headed)
-        try:
-            result = checkout.run_checkout(
-                page, person, dry_run=args.dry_run,
-                expect_cents=best.price_cents,
-                out_dir=HERE / "receipts" / cfg.target_id)
-        finally:
-            browser.close()
+        with sync_playwright() as p:
+            browser, _, page = checkout.open_listing(p, url, headless=not args.headed)
+            clock.mark("browser + listing")
+            try:
+                result = checkout.run_checkout(
+                    page, person, dry_run=args.dry_run,
+                    expect_cents=best.price_cents,
+                    out_dir=HERE / "receipts" / cfg.target_id, clock=clock)
+            finally:
+                browser.close()
 
-    if result.get("dry_run"):
-        print(f"\n✅ dry run: stopped one click short of 'Comprar agora'. "
-              f"Nothing was ordered.\n   {result}")
+        if result.get("dry_run"):
+            print(f"\n\u2705 dry run: stopped one click short of 'Comprar agora'. "
+                  f"Nothing was ordered.\n   {result}")
+            return 0
+
+        notify.send_pix(
+            os.environ.get("TELEGRAM_BOT_TOKEN", ""),
+            os.environ.get("TELEGRAM_CHAT_ID", ""),
+            label=cfg.label, item=best.item,
+            price_brl=_fmt_brl(best.price_cents),
+            pix_code=result["pix_code"], qr_png=result.get("qr_png"),
+        )
         return 0
-
-    notify.send_pix(
-        os.environ.get("TELEGRAM_BOT_TOKEN", ""),
-        os.environ.get("TELEGRAM_CHAT_ID", ""),
-        label=cfg.label, item=best.item,
-        price_brl=_fmt_brl(best.price_cents),
-        pix_code=result["pix_code"], qr_png=result.get("qr_png"),
-    )
-    return 0
+    finally:
+        # \u26d4 In `finally`: an abort is exactly when the breakdown matters most, and a
+        # report that prints only on success cannot explain a run that ran out of time.
+        print("\n" + clock.report(budget_s=BUDGET_S), flush=True)
 
 
 def main(argv=None) -> int:
