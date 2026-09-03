@@ -83,7 +83,38 @@ handed a code and pay it.
   to buy, on an account a human already made.
 - **No credential storage.** The session comes from `buy.py login`, where a human types
   the password into a real browser.
-- **One reservation per run.** No loops, no queue-jumping, no parallel sessions.
+- **One reservation per invocation. One per night, ever.** ⚠️ This SUPERSEDES the
+  original "no loops" rule, and it is narrower than it sounds — every clause carries
+  weight. `buy.py autobuy` is a cron entry point that may reserve **at most one** ticket
+  per run, on **at most one** night ever (a ledger in `state/`, plus the target disarms
+  itself the moment it buys), inside a **time window**, behind an **exclusive lock**.
+  - ⛔ The lock is load-bearing, not hygiene. A buy takes ~40 s and cron fires every
+    minute, so invocations *will* overlap; two runs seeing one dip is "one intended
+    ticket becomes two" arriving by schedule instead of by retry.
+  - ⛔ Record the fire in the ledger **before** notifying. A delivery failure must never
+    leave a real reservation absent from the ledger — that is how the next minute buys
+    a second ticket for the same night.
+  - Still no queue-jumping and no parallel sessions.
+- **The trigger is price-watcher's history; the authority is a live re-resolve.** Reading
+  the file price-watcher just wrote costs zero extra requests, where a second 7-night
+  poller would nearly double a request budget the README treats as a design input.
+  `cmd_buy` re-resolves live before it spends, so a dip that has evaporated becomes a
+  `NoMatch` — stale-by-a-minute is safe in the only direction that matters.
+- ⛔ **History age is NOT freshness — it is volatility.** price-watcher appends only when
+  a reading *changes* (`unchanged since the last recording — nothing written`), so a
+  healthy poller on a stable market writes nothing for hours. An age cutoff over those
+  files would call a price that dropped to R$150 and *held* "blind" and skip the exact
+  dip this tool exists for. Liveness comes from the poller's own cron log, which is
+  touched on every run. Carry the last reading forward, whatever its age.
+- ⛔ **The window is pinned to `America/Sao_Paulo`, never the daemon's TZ.** cron inherits
+  whatever the daemon has — frequently UTC on WSL — and a 10:00–04:00 window read in UTC
+  becomes 07:00–01:00 BRT: it refuses to buy for three morning hours *and* fires at 02:00
+  while nobody is awake to pay. Both halves are invisible in a log.
+- ⛔ **A dead session must SHOUT.** It is the failure that deletes this feature rather than
+  degrading it: the observed session lasted under four hours, and without an alert the
+  cron goes on finding dips and failing to buy them into a log nobody reads. Alerted on
+  Telegram, throttled — 1,440 identical messages a day would mute the channel the Pix
+  code arrives on.
 
 ## Before writing a checkout selector
 

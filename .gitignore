@@ -36,3 +36,8 @@ receipts/
 # Checkout recon dumps: full-page screenshots and DOM of a LOGGED-IN session. The
 # screenshots show account details and the JSON can carry prefilled values.
 recon/
+
+# Runtime state: the fired-ledger (which nights have already reserved) and the
+# cron lock. Not secret, but it is per-machine truth about real reservations -- a
+# committed ledger from another machine would tell this one a night already fired.
+state/

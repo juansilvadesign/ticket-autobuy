@@ -72,3 +72,47 @@ the hold lapse.
 ## Exit codes
 
 `0` ok / nothing matched · `1` config · `2` blind (site unreadable) · `3` you were not told
+
+
+## Unattended auto-buy (`buy.py autobuy`)
+
+Fires once per night when the market dips under that target's `buy.max_price_brl`.
+Armed 2026-09-02 for all 7 Rock in Rio nights at **R$ 200,00**, one reservation per
+night, **10:00–04:00 BRT**.
+
+```cron
+# ticket-autobuy — check every minute; costs ZERO extra requests to the site (it reads
+# the history price-watcher just wrote) and only touches the network when it buys.
+* * * * * /abs/path/ticket-autobuy/.venv/bin/python /abs/path/ticket-autobuy/buy.py autobuy >> /abs/path/ticket-autobuy/state/autobuy.log 2>&1
+```
+
+⚠️ **The venv python is load-bearing** — `autobuy` drives Playwright, which `/usr/bin/python3`
+does not have. price-watcher's cron lines deliberately use the system python; this one
+must not.
+
+### What stops it running away
+
+| guard | what it prevents |
+|---|---|
+| ledger in `state/autobuy.json` + the target disarms itself | a night buying twice |
+| exclusive `flock` | two overlapping cron runs both seeing one dip |
+| window 10:00–04:00 BRT, timezone pinned | reserving a ~10-minute hold while you sleep |
+| live re-resolve before the click | buying at a price that already moved |
+| `assert_poller_alive` | reading a dead price-watcher as a calm market |
+
+### Turning it off
+
+```bash
+crontab -e            # delete the autobuy line
+# or, to disarm without touching cron:
+python - <<'EOF'
+import json, pathlib
+for p in pathlib.Path("../price-watcher/targets").glob("*.json"):
+    d = json.loads(p.read_text()); d.get("buy", {})["enabled"] = False
+    p.write_text(json.dumps(d, indent=2, ensure_ascii=False) + "\n")
+EOF
+```
+
+🔴 **The session is the real limit.** The observed BuyTicket session lasted under four
+hours. Until that is understood, expect to re-run `python buy.py login` roughly daily —
+the runner sends a Telegram alert the first time it finds a dip it cannot buy.
