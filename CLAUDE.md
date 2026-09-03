@@ -22,11 +22,17 @@ does not gain a buy path. Two consequences follow, and both are load-bearing:
 
 ## The one architectural rule
 
-**It reserves; it never pays.** The site holds a reserved ticket for ~30 minutes against
-an unpaid Pix. That hold **is** the human gate: the worst a bug can do is create a
-reservation that lapses on its own. Nothing in this repo may ever acquire the ability to
-settle a payment — not a saved card, not a bank integration, not a Pix automation.
-This is not a v1 limitation.
+**It reserves; it never pays.** The site holds a reserved ticket against an unpaid Pix.
+That hold **is** the human gate: the worst a bug can do is create a reservation that
+lapses on its own. Nothing in this repo may ever acquire the ability to settle a payment
+— not a saved card, not a bank integration, not a Pix automation. This is not a v1
+limitation.
+
+⏰ **The hold is ~10 minutes, not ~30.** Measured on the first real order (#7707X57Q,
+2026-09-02): the checkout says *"Você tem 10 minutos para completar sua compra"* and the
+order screen counts down from there. Every earlier version of this file said 30, which
+is not a rounding error — it is three times the real margin for a human who has to be
+handed a code and pay it.
 
 ## Invariants — do not quietly break these
 
@@ -54,6 +60,12 @@ This is not a v1 limitation.
 - ⛔ **Never retry a failed checkout automatically.** A half-finished flow may or may not
   have created a reservation, and a blind retry is how one intended ticket becomes two.
   Re-read the state and decide by hand.
+- **An order without a captured code is bad, but RECOVERABLE — say so.** The order is
+  findable afterwards at `/ingressos` → **Comprados**, and its code re-readable from the
+  order screen. ⛔ Never point a human at the *checkout* URL to look for it: reopening
+  that starts a FRESH checkout showing no order, which reads as "nothing was reserved"
+  while a real reservation runs down its clock. That misread happened, live, on
+  2026-09-02 before the Comprados tab settled it.
 - ⛔ **`.env` is parsed, never sourced.**
 - ⛔ **The session file is worth more than the password** — it skips the login gate
   entirely. Same for `fields.json` (CPF, address). Both gitignored *in this tree*: a

@@ -108,7 +108,8 @@ Event 04/09 14h00 → the window shut **02/09 14h00**. Anything paid for on buy 
 non-refundable.
 
 ⇒ This is a constraint on **paying**, not on the bot: the tool only ever *reserves*, and
-the ~30-minute Pix hold is the human gate. The worst a bug can do is create a
+the Pix hold (⏰ ~**10** minutes, measured — not the 30 assumed here originally) is the
+human gate. The worst a bug can do is create a
 reservation that lapses by itself. It is recorded here because it is the reason the tool
 must never be given the ability to pay.
 
@@ -132,6 +133,18 @@ which is not crawling.
 was therefore reported as a failure and the session discarded. **A path read out of
 prose is a guess** — probe a URL you have watched respond. Verification now uses the
 homepage, which is confirmed 200.
+
+✅ **The real paths, read off the logged-in nav 2026-09-02** (not guessed):
+
+| path | what it is |
+|---|---|
+| `/minha-conta` | profile + seller balance. **200** — note the singular, and no `s` |
+| `/ingressos` | tabs: *Meus anúncios* · **Comprados** · *Vendidos* |
+| `/ingressos?pagina=comprado&ID=<bubble-id>` | ⭐ one order: status, countdown, `Copiar código` |
+
+⭐ **`Comprados` is where an order can be confirmed to exist.** It is the only view that
+answers "did my checkout actually reserve something", and it settled exactly that
+question on the first real purchase.
 
 ⚠️ 30 s was not a generous navigation timeout on a page that needs 13 s cold; headed,
 with a cold profile, it left about one slow render of margin. Now 90 s with one retry,
@@ -207,16 +220,38 @@ The site **auto-masks** plain digits — send digits only, unformatted:
 ⛔ Example values above are deliberately fake. Real buyer data lives only in
 `fields.json`, which is gitignored — never quote it into a document that ships.
 
-## 🔲 The one leg still unverified
+## ✅ The Pix leg — VERIFIED 2026-09-02, and all three guesses were wrong
 
-**The Pix screen itself.** It exists only after an order is created, and creating one to
-look at it is exactly what this tool must not do speculatively. `_extract_pix` therefore
-reads several shapes (readonly input, textarea, page text matching a `0002…` EMV
-payload) and **raises** if none match — because a reservation that exists while its code
-was not captured is the worst state this tool can leave behind. That error tells you to
-open the URL and pay by hand, and ⛔ never to re-run, which would reserve a second ticket.
+The first real purchase (order **#7707X57Q**, Gramado ‖ Outras Meias, R$ 275,00) closed
+this gap and **overturned the premise of `_extract_pix` completely**.
 
-One real purchase will confirm it.
+It had been written blind against three plausible shapes — a readonly input, a textarea,
+and page text matching a `0002…` EMV payload. **The code is in none of them.** It is not
+in the DOM at all. The order screen renders the words *"Código Pix"* beside a
+`Copiar código` button, and the payload exists only on the **clipboard** that button's
+handler writes.
+
+⭐ The working path, and the two traps around it:
+
+| | |
+|---|---|
+| the button | `<button id="btn_copy">Copiar código</button>` — a stable Bubble id (its `class` carries a hash; ⛔ don't select on that) |
+| trap 1 | A `<div class="greyout …">` overlays it. Playwright's `.click()` reports the button *"visible, enabled and stable"* and then times out after 30 s. `document.querySelector(sel).click()` via `evaluate` dispatches the handler directly and is not subject to pointer interception. |
+| trap 2 | The context needs `clipboard-read`, or `navigator.clipboard.readText()` rejects and returns nothing — indistinguishable from "there was no code". Granted at context creation in `open_listing`. |
+
+⚠️ **What failed on the night was the CAPTURE, not the reservation.** The order was
+created correctly and the price guard passed exactly (`Valor total` R$ 275,00 ==
+resolved R$ 275,00). `_extract_pix` ran while the page still showed an *"Aguarde…"*
+spinner and found nothing, so the tool raised its loudest error over a purchase that had
+in fact worked.
+
+⛔ **And its recovery advice pointed nowhere useful:** it named the *checkout* URL, but
+reopening that starts a FRESH checkout showing no order. Following it produced a
+confident "no order exists" while #7707X57Q sat in Comprados counting down. Fixed — the
+error now names `/ingressos` → **Comprados**.
+
+Pinned as regression tests in `tests/test_listing.py`, including a fake page whose
+`.click()` raises, so a return to the intercepted path fails loudly.
 
 ## Headless: ✅ verified, and faster
 
