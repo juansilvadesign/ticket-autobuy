@@ -60,6 +60,11 @@ handed a code and pay it.
 - ⛔ **Never retry a failed checkout automatically.** A half-finished flow may or may not
   have created a reservation, and a blind retry is how one intended ticket becomes two.
   Re-read the state and decide by hand.
+- **The Pix code is never on the checkout page.** The final click leaves the page on
+  its `/checkout` URL showing "Aguarde…", and no code ever renders there. It is on the
+  order — `/ingressos` → **Comprados** → the pending row. Two real purchases were
+  reported as failures before this was understood; a longer wait would never have fixed
+  either, because the tool was reading a page the payload does not appear on.
 - **An order without a captured code is bad, but RECOVERABLE — say so.** The order is
   findable afterwards at `/ingressos` → **Comprados**, and its code re-readable from the
   order screen. ⛔ Never point a human at the *checkout* URL to look for it: reopening

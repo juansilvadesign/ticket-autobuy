@@ -239,11 +239,27 @@ handler writes.
 | trap 1 | A `<div class="greyout …">` overlays it. Playwright's `.click()` reports the button *"visible, enabled and stable"* and then times out after 30 s. `document.querySelector(sel).click()` via `evaluate` dispatches the handler directly and is not subject to pointer interception. |
 | trap 2 | The context needs `clipboard-read`, or `navigator.clipboard.readText()` rejects and returns nothing — indistinguishable from "there was no code". Granted at context creation in `open_listing`. |
 
-⚠️ **What failed on the night was the CAPTURE, not the reservation.** The order was
+### 🔴 And the code is not on the checkout page AT ALL
+
+The deeper correction, from the second real order (**#1280BPGN**), after the clipboard
+fix was already in: **clicking the final "Comprar agora" does not turn the checkout into
+a Pix screen.** The page keeps its `/checkout?…&p=2` URL, shows *"Aguarde…"*, and never
+renders a code. Waiting longer does not help — the code was never coming to that page.
+
+⚠️ This is why the first fix looked wrong when it was right. `_extract_pix` was correct
+and still returned nothing, because it was pointed at a page that has no code on it. The
+0.42 s it took was the tell: too fast to have even tried the clipboard, i.e. no
+`#btn_copy` existed to click.
+
+⭐ The code is on the **order**: `/ingressos` → **Comprados** → the pending row, where
+`#btn_copy` appears within **0.04 s** of opening it. `_pix_from_orders_page` goes there,
+and it is read-only — it navigates and clicks account UI, and cannot create an order.
+
+Measured live: **6.56 s** from the checkout page to a captured code.
+
+⚠️ **What failed on both nights was the CAPTURE, not the reservation.** Both orders were
 created correctly and the price guard passed exactly (`Valor total` R$ 275,00 ==
-resolved R$ 275,00). `_extract_pix` ran while the page still showed an *"Aguarde…"*
-spinner and found nothing, so the tool raised its loudest error over a purchase that had
-in fact worked.
+resolved R$ 275,00). The tool raised its loudest error over purchases that had worked.
 
 ⛔ **And its recovery advice pointed nowhere useful:** it named the *checkout* URL, but
 reopening that starts a FRESH checkout showing no order. Following it produced a
