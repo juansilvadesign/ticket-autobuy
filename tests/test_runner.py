@@ -259,3 +259,98 @@ def test_a_different_problem_alerts_independently():
     now = datetime.now(timezone.utc)
     assert runner.should_alert(st, "session_dead", now=now) is True
     assert runner.should_alert(st, "poller_dead", now=now) is True
+
+
+# ------------------------------------------------------------------ the alert path
+
+def _autobuy_world(tmp_path, monkeypatch):
+    """The minimum world in which `cmd_autobuy` actually reaches the buy: one armed
+    target, a dip in history, a live poller, an empty ledger, inside the window."""
+    from types import SimpleNamespace
+    import buy as buy_mod
+
+    targets = tmp_path / "targets"; targets.mkdir()
+    hist = tmp_path / "history"; hist.mkdir()
+    state = tmp_path / "state"; state.mkdir()
+
+    (targets / "n.json").write_text(json.dumps({
+        "id": "n", "label": "Night N",
+        "params": {"event_slug": "e", "data_millis": 1, "evento_local": "l"},
+        "buy": {"enabled": True, "max_price_brl": 200.0, "quantity": 1,
+                "sector": ["Gramado"], "entry_class": None}}), encoding="utf-8")
+    (hist / "n.jsonl").write_text(json.dumps({
+        "target_id": "n", "item": "Gramado || Inteira", "price_cents": 19800,
+        "quantity": 1, "available": True,
+        "captured_at": datetime.now(timezone.utc).isoformat(),
+        "extra": {"sector": "Gramado", "entry_class": "Inteira"}}) + "\n",
+        encoding="utf-8")
+    (hist / "cron.log").write_text("alive\n", encoding="utf-8")
+
+    monkeypatch.setattr(runner, "STATE_DIR", state)
+    monkeypatch.setattr(runner, "STATE_PATH", state / "autobuy.json")
+    monkeypatch.setattr(runner, "LOCK_PATH", state / "autobuy.lock")
+    monkeypatch.setattr(runner, "now_local", lambda: _t(15))       # inside 10:00-04:00
+
+    sent: list[str] = []
+    monkeypatch.setattr(buy_mod.notify, "send_text",
+                        lambda tok, chat, text: sent.append(text))
+    # ⭐ The FILE check PASSES. That is the whole point: a logged-out session still has
+    # a file and still has cookies, so `require()` is not where it is discovered.
+    monkeypatch.setattr(buy_mod.session, "require", lambda *a, **k: tmp_path / "s.json")
+
+    args = SimpleNamespace(targets=str(targets), history=str(hist),
+                           fields=str(tmp_path / "f.json"), verbose=False)
+    return buy_mod, args, sent
+
+
+def test_a_session_that_dies_at_the_BROWSER_still_alerts(tmp_path, monkeypatch):
+    """⛔ THE regression, and it was silent. `session.require()` is a FILE check, so a
+    session that exists, carries cookies and is thoroughly logged out sails straight
+    through it. The real probe is inside `open_listing`, behind the browser, and its
+    `SessionError` used to travel past the alert branch to exit 3.
+
+    Measured 2026-09-04: a 36 h-old session against an observed lifetime under 4 h,
+    3 `Entrar` links on the homepage, ZERO 'not authenticated' lines in autobuy.log and
+    no state file at all -- the guard CLAUDE.md calls load-bearing had never fired once.
+    """
+    from autobuy.errors import SessionError
+    buy_mod, args, sent = _autobuy_world(tmp_path, monkeypatch)
+
+    def _dies_at_the_browser(*a, **k):
+        raise SessionError("not authenticated -- the page still shows 3 'Entrar' link(s)")
+    monkeypatch.setattr(buy_mod, "_execute_buy", _dies_at_the_browser)
+
+    with pytest.raises(SessionError):
+        buy_mod.cmd_autobuy(args)
+
+    assert sent, "a session that dies at the BROWSER must still SHOUT"
+    assert "BLIND" in sent[0] and "buy.py login" in sent[0]
+
+
+def test_an_absent_session_file_still_alerts(tmp_path, monkeypatch):
+    """The original call site must keep working -- the fix ADDS a second one."""
+    from autobuy.errors import SessionError
+    buy_mod, args, sent = _autobuy_world(tmp_path, monkeypatch)
+
+    def _no_file(*a, **k):
+        raise SessionError("no session at ...")
+    monkeypatch.setattr(buy_mod.session, "require", _no_file)
+
+    with pytest.raises(SessionError):
+        buy_mod.cmd_autobuy(args)
+    assert sent and "BLIND" in sent[0]
+
+
+def test_a_dip_that_evaporated_is_NOT_a_dead_session(tmp_path, monkeypatch):
+    """⚠️ The PERMIT leg. `NoMatch` is the ordinary outcome on a fast market; alerting
+    on it would send the 1,440-a-day flood the throttle exists to prevent, on a channel
+    that has to stay readable because the Pix code arrives there."""
+    from autobuy.errors import NoMatch
+    buy_mod, args, sent = _autobuy_world(tmp_path, monkeypatch)
+
+    def _evaporated(*a, **k):
+        raise NoMatch("gone before we got there")
+    monkeypatch.setattr(buy_mod, "_execute_buy", _evaporated)
+
+    assert buy_mod.cmd_autobuy(args) == 0
+    assert not sent, "an evaporated dip must never fire the dead-session alert"

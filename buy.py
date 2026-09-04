@@ -185,6 +185,35 @@ def cmd_buy(args) -> int:
         print("\n" + clock.report(budget_s=BUDGET_S), flush=True)
 
 
+def _alert_session_dead(state: dict, cfg, hit: dict) -> None:
+    """Telegram the failure that DELETES this feature instead of degrading it.
+
+    ⛔ Called from BOTH places a dead session can surface, because the obvious one is
+    not the one that fires. `session.require()` is a FILE check: it passes happily on a
+    session that exists, carries cookies, and is thoroughly logged out. The real probe
+    is `checkout.open_listing`, behind the browser -- and its `SessionError` used to
+    travel straight past this alert into exit 3.
+
+    Measured 2026-09-04, on a session 36 h old against an observed lifetime under 4 h:
+    the homepage showed 3 `Entrar` links, `state/autobuy.json` did not exist, and
+    `state/autobuy.log` held ZERO "not authenticated" lines. The guard CLAUDE.md calls
+    load-bearing had never once fired -- it was a declaration nothing asserted.
+
+    ⚠️ Throttled via `should_alert`: a 1-minute cron would otherwise send 1,440
+    identical messages a day and train the reader to mute the channel the Pix code
+    arrives on.
+    """
+    if runner.should_alert(state, "session_dead"):
+        runner._write_state(state)
+        notify.send_text(
+            os.environ.get("TELEGRAM_BOT_TOKEN", ""),
+            os.environ.get("TELEGRAM_CHAT_ID", ""),
+            f"\U0001f534 ticket-autobuy is BLIND\n\n{cfg.label} dipped to "
+            f"{_fmt_brl(hit['price_cents'])} and it could NOT buy: the "
+            f"BuyTicket session is dead.\n\nRun:  python buy.py login\n\n"
+            f"Nothing is being bought on any night until you do.")
+
+
 def cmd_autobuy(args) -> int:
     """Cron entry point. At most ONE reservation per invocation, one per night ever."""
     from datetime import datetime, timezone
@@ -237,16 +266,8 @@ def cmd_autobuy(args) -> int:
             # says "re-login" rather than arriving as a checkout stack trace.
             try:
                 session.require()
-            except SessionError as e:
-                if runner.should_alert(state, "session_dead"):
-                    runner._write_state(state)
-                    notify.send_text(
-                        os.environ.get("TELEGRAM_BOT_TOKEN", ""),
-                        os.environ.get("TELEGRAM_CHAT_ID", ""),
-                        f"\U0001f534 ticket-autobuy is BLIND\n\n{cfg.label} dipped to "
-                        f"{_fmt_brl(hit['price_cents'])} and it could NOT buy: the "
-                        f"BuyTicket session is dead.\n\nRun:  python buy.py login\n\n"
-                        f"Nothing is being bought on any night until you do.")
+            except SessionError:
+                _alert_session_dead(state, cfg, hit)
                 raise
 
             print(f"\u2193 {cfg.label}: {hit['item']} at "
@@ -260,6 +281,12 @@ def cmd_autobuy(args) -> int:
                 # most likely outcome on a fast market, and an ordinary no-op.
                 print("   gone before we got there; nothing ordered", flush=True)
                 continue
+            except SessionError:
+                # ⭐ THE path that actually fires. `session.require()` above already
+                # passed -- it is a file check -- and the live probe inside
+                # `open_listing` is where a logged-out session is really discovered.
+                _alert_session_dead(state, cfg, hit)
+                raise
             finally:
                 print("\n" + clock.report(budget_s=BUDGET_S), flush=True)
 

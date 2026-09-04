@@ -120,6 +120,43 @@ def send_pix(token: str, chat_id: str, *, label: str, item: str, price_brl: str,
             print(f"⚠️  QR image not delivered ({e}); the copia-e-cola above did land.",
                   flush=True)
 
+    # ⏰ Sent LAST, so it is the NEWEST message -- the one sitting above the keyboard
+    # while the hold runs down. Like the QR, it rides on top of a code that already
+    # landed in the message above, so its failure must not turn a complete success
+    # into exit 3.
+    try:
+        send_code_alone(token, chat_id, pix_code)
+    except Exception as e:                                  # noqa: BLE001
+        print(f"⚠️  tap-to-copy message not delivered ({e}); the code above did land.",
+              flush=True)
+
+
+def _utf16_len(s: str) -> int:
+    """Telegram entity offsets and lengths are counted in UTF-16 code units, not in
+    Python characters. A Pix payload is ASCII today, so the two agree -- but the day
+    one is not, a `len()` here would silently truncate the tap-to-copy region."""
+    return len(s.encode("utf-16-le")) // 2
+
+
+def send_code_alone(token: str, chat_id: str, pix_code: str) -> None:
+    """The payload ALONE, as a tap-to-copy `code` entity.
+
+    ⏰ Why this is a second message rather than better formatting on the first: on the
+    first order that was actually paid (#6999ZUKS, 2026-09-04) the code arrived inside
+    the reservation message and had to be hand-SELECTED to be copied, against a
+    ~10-minute hold. A message holding nothing but the payload is one tap. The
+    reservation message is unchanged -- this is added next to it, not instead of it.
+
+    ⛔ Still no `parse_mode` -- see the note above `send_pix`. `entities` carries the
+    formatting out of band, so the text goes VERBATIM and no character in the payload
+    (a Pix EMV string is full of `*`, `.` and `/`) can break the send.
+    """
+    _call(token, "sendMessage", {
+        "chat_id": chat_id, "text": pix_code,
+        "entities": json.dumps([{"type": "code", "offset": 0,
+                                 "length": _utf16_len(pix_code)}]),
+        "disable_web_page_preview": "true"})
+
 
 def send_text(token: str, chat_id: str, text: str) -> None:
     print(text, flush=True)
