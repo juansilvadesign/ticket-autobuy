@@ -35,7 +35,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .errors import CheckoutError, OrderMayExistError, SessionError
+from .errors import AutobuyError, CheckoutError, OrderMayExistError, SessionError
 from . import session as session_mod
 
 # ⚠️ buyticketbrasil takes ~12s to reach domcontentloaded from this machine, measured
@@ -831,7 +831,21 @@ def run_checkout(page, person: Person, *, dry_run: bool = True,
             # ⚠️ 10 s, not the 30 s default: an intercepted click should end the run
             # fast so the next cron minute can retry, rather than eat the budget that
             # decides whether the listing still exists when we click buy.
-            cont.click(timeout=10_000)
+            try:
+                cont.click(timeout=10_000)
+            except Exception as e:                         # noqa: BLE001
+                # ⛔🔴 Observed live 2026-09-05 13:05 on a real R$132,00 dip: the
+                # greyout overlay intercepted this click and playwright raised its OWN
+                # TimeoutError -- a class this package's grammar does not know. It flew
+                # out of run_checkout, _execute_buy, cmd_autobuy AND main() uncaught:
+                # raw traceback, exit 1, which buy.py documents as "usage or config
+                # error". Graded here instead. ⭐ CheckoutError, never
+                # OrderMayExistError: this is strictly pre-click, so the night must NOT
+                # be bookkept out of play.
+                raise CheckoutError(
+                    f"step {step}: the 'Continuar' click never landed at {page.url} -- "
+                    f"{type(e).__name__}: {e}\n"
+                    f"Nothing was ordered. The next run retries.") from e
             page.wait_for_timeout(2000)
             continue
 
@@ -847,7 +861,15 @@ def run_checkout(page, person: Person, *, dry_run: bool = True,
         # having exercised nothing, which is a pass that proves the flow works when it
         # never ran.
         if step == 1:
-            final.click()
+            try:
+                final.click()
+            except Exception as e:                         # noqa: BLE001
+                # Screen 1's button merely OPENS the checkout -- pre-order, so this is
+                # graded exactly like the 'Continuar' failure above.
+                raise CheckoutError(
+                    f"step 1: the 'Comprar agora' that OPENS the checkout never landed "
+                    f"at {page.url} -- {type(e).__name__}: {e}\n"
+                    f"Nothing was ordered. The next run retries.") from e
             page.wait_for_timeout(2500)
             continue
 
@@ -876,50 +898,94 @@ def run_checkout(page, person: Person, *, dry_run: bool = True,
             return {"dry_run": True, "price_cents": shown, "url": page.url,
                     "note": "stopped one click short of 'Comprar agora'"}
 
-        final.click()
+        try:
+            final.click()
+        except Exception as e:                             # noqa: BLE001
+            # ⛔🔴 THE point of no return. `click()` dispatches the input event and can
+            # time out AFTER dispatching, so "it raised" does NOT prove the order was
+            # not created -- see the sibling rule "an error AFTER the side effect is
+            # not a failure". Graded OrderMayExistError so the caller records the fire
+            # and DISARMS the night.
+            # ⚠️ Fails CLOSED on purpose: clearing one ledger key by hand is cheap, a
+            # duplicate reservation on a 1-minute cron is not.
+            raise OrderMayExistError(
+                f"AN ORDER MAY EXIST -- the final click raised at {page.url}.\n"
+                f"{type(e).__name__}: {e}\n"
+                f"⚠️ Check {ORDERS_URL} -> the 'Comprados' tab BEFORE re-arming: the "
+                f"click may have dispatched before it raised.\n"
+                f"⛔ NOT at {page.url} -- reopening a checkout URL starts a FRESH "
+                f"checkout and shows no order, which reads as 'nothing was reserved' "
+                f"while a real reservation runs down its clock.\n"
+                f"⏰ The hold is ~10 MINUTES from the order, not 30.\n"
+                f"⛔ Do not re-run this command; it would reserve a second ticket.") from e
         break
     else:
         raise CheckoutError("checkout did not reach a final control in 8 screens")
 
     # ── an order now exists; capturing its code is the only thing that matters ──────
-    if clock is not None:
-        clock.mark("ORDER CREATED (final click)")
-    page.wait_for_timeout(4000)
-    settle(page, timeout_ms=120_000)
-    if clock is not None:
-        clock.mark("order screen settled")
-    if out_dir:
-        page.screenshot(path=str(out_dir / "order.png"), full_page=True)
+    # ⛔🔴 EVERYTHING below runs while a REAL reservation is already counting down its
+    # ~10-minute hold. A raw driver exception here used to escape `run_checkout`
+    # uncaught exactly as the intercepted click did on 2026-09-05 — so the caller never
+    # reached `OrderMayExistError`, the ledger was never written and the night stayed
+    # ARMED, which on a 1-minute cron is how one intended ticket becomes two.
+    # ⭐ `settle` and `_extract_pix` already swallow their own driver errors, so the
+    # realistic raisers are the screenshot and `_pix_from_orders_page`'s navigation —
+    # narrow, but the consequence is a live unpaid hold nobody is told about.
+    try:
+        if clock is not None:
+            clock.mark("ORDER CREATED (final click)")
+        page.wait_for_timeout(4000)
+        settle(page, timeout_ms=120_000)
+        if clock is not None:
+            clock.mark("order screen settled")
+        if out_dir:
+            page.screenshot(path=str(out_dir / "order.png"), full_page=True)
 
-    pix = _extract_pix(page)
-    if not pix:
-        # The checkout page never becomes the Pix screen -- go to the order itself.
-        pix = _pix_from_orders_page(page)
-    if clock is not None:
-        clock.mark("PIX CODE EXTRACTED")
-    if not pix:
-        # ⛔ Never retried and never swallowed. A retry would risk a SECOND reservation,
-        # and a swallow would leave a real, paid-for-able order with no code to pay it.
+        pix = _extract_pix(page)
+        if not pix:
+            # The checkout page never becomes the Pix screen -- go to the order itself.
+            pix = _pix_from_orders_page(page)
+        if clock is not None:
+            clock.mark("PIX CODE EXTRACTED")
+        if not pix:
+            # ⛔ Never retried and never swallowed. A retry would risk a SECOND reservation,
+            # and a swallow would leave a real, paid-for-able order with no code to pay it.
+            raise OrderMayExistError(
+                f"AN ORDER MAY EXIST but no Pix code could be read.\n"
+                f"⚠️ Find it at {ORDERS_URL} -> the 'Comprados' tab, open the order and "
+                f"press 'Copiar código'.\n"
+                f"⛔ NOT at {page.url} -- reopening a checkout URL starts a FRESH checkout "
+                f"and shows no order, which reads as 'nothing was reserved' while a real "
+                f"reservation is running down its clock.\n"
+                f"⏰ The hold is ~10 MINUTES from the order, not 30.\n"
+                f"A screenshot is in {out_dir or '(no out_dir given)'}.\n"
+                f"⛔ Do not re-run this command; it would reserve a second ticket.")
+
+        qr = None
+        if out_dir:
+            try:
+                img = page.locator("img[src^='data:image'], canvas").first
+                if img.count():
+                    qr = out_dir / "pix-qr.png"
+                    img.screenshot(path=str(qr))
+            except Exception:                                  # noqa: BLE001
+                qr = None
+        return {"dry_run": False, "pix_code": pix["pix_code"], "qr_png": qr,
+                "source": pix.get("source"),
+                "order_url": pix.get("order_url") or page.url, "url": page.url}
+    except AutobuyError:
+        # ⛔ Already graded — including the tail's OWN OrderMayExistError, whose message
+        # names the 'Copiar código' button. Re-wrapping it would bury that guidance.
+        raise
+    except Exception as e:                                 # noqa: BLE001
         raise OrderMayExistError(
-            f"AN ORDER MAY EXIST but no Pix code could be read.\n"
+            f"AN ORDER MAY EXIST -- it was created, then reading its code failed at "
+            f"{page.url}.\n"
+            f"{type(e).__name__}: {e}\n"
             f"⚠️ Find it at {ORDERS_URL} -> the 'Comprados' tab, open the order and "
             f"press 'Copiar código'.\n"
             f"⛔ NOT at {page.url} -- reopening a checkout URL starts a FRESH checkout "
             f"and shows no order, which reads as 'nothing was reserved' while a real "
             f"reservation is running down its clock.\n"
             f"⏰ The hold is ~10 MINUTES from the order, not 30.\n"
-            f"A screenshot is in {out_dir or '(no out_dir given)'}.\n"
-            f"⛔ Do not re-run this command; it would reserve a second ticket.")
-
-    qr = None
-    if out_dir:
-        try:
-            img = page.locator("img[src^='data:image'], canvas").first
-            if img.count():
-                qr = out_dir / "pix-qr.png"
-                img.screenshot(path=str(qr))
-        except Exception:                                  # noqa: BLE001
-            qr = None
-    return {"dry_run": False, "pix_code": pix["pix_code"], "qr_png": qr,
-            "source": pix.get("source"),
-            "order_url": pix.get("order_url") or page.url, "url": page.url}
+            f"⛔ Do not re-run this command; it would reserve a second ticket.") from e
