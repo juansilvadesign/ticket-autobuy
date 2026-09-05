@@ -19,7 +19,8 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from autobuy import config, runner                                    # noqa: E402
-from autobuy.errors import AutobuyError, ConfigError                  # noqa: E402
+from autobuy.errors import (AutobuyError, ConfigError, NoMatch,      # noqa: E402
+                            ResolveError)
 
 BRT = runner.TZ
 
@@ -438,3 +439,56 @@ def test_a_PRE_click_checkout_failure_does_NOT_take_the_night_out_of_play(
     assert runner._read_state().get("fired", {}) == {}, "nothing was ordered"
     raw = json.loads((tmp_path / "targets" / "n.json").read_text(encoding="utf-8"))
     assert raw["buy"]["enabled"] is True, "the night must stay armed for the retry"
+
+
+def test_one_BLIND_night_does_not_hide_every_LATER_night(tmp_path, monkeypatch):
+    """⛔🔴 Observed 2026-09-05: 468 consecutive runs died at the first armed target.
+
+    `cmd_autobuy` caught `NoMatch`, `SessionError` and `OrderMayExistError` around
+    `_execute_buy` but not `ResolveError`, so a blind LIVE re-resolve escaped the
+    per-target loop to `main()` (exit 2) and took the whole run with it. Targets
+    iterate in `sorted()` order, so 04/09 -- left armed at a temporary R$1.000 ceiling
+    and blind since its event ended ('matriz_preco' gone) -- matched at R$297 every
+    single minute and aborted the run before 05/09..13/09 were ever evaluated. Their
+    dips were invisible for ~7.8 h, including a 40-minute R$198,00 window with ~190
+    available on 2026-09-04, and `autobuy.log` held ZERO lines for any of them.
+
+    ⭐ Blindness must still SHOUT (the `if blind:` raise), and the night must stay
+    armed: `_resolve` runs before the browser, so a `ResolveError` is strictly
+    pre-click and no order can exist.
+    """
+    buy_mod, args, _ = _autobuy_world(tmp_path, monkeypatch)
+
+    # A SECOND armed night with the same dip, sorting AFTER the first.
+    targets, hist = tmp_path / "targets", tmp_path / "history"
+    for name, tid in (("z.json", "z"),):
+        (targets / name).write_text(json.dumps({
+            "id": tid, "label": "Night Z",
+            "params": {"event_slug": "e", "data_millis": 2, "evento_local": "l"},
+            "buy": {"enabled": True, "max_price_brl": 200.0, "quantity": 1,
+                    "sector": ["Gramado"], "entry_class": None}}), encoding="utf-8")
+        (hist / f"{tid}.jsonl").write_text(json.dumps({
+            "target_id": tid, "item": "Gramado || Inteira", "price_cents": 19800,
+            "quantity": 1, "available": True,
+            "captured_at": datetime.now(timezone.utc).isoformat(),
+            "extra": {"sector": "Gramado", "entry_class": "Inteira"}}) + "\n",
+            encoding="utf-8")
+
+    seen: list[str] = []
+
+    def _blind_on_the_first_night(cfg, **k):
+        seen.append(cfg.target_id)
+        if cfg.target_id == "n":
+            raise ResolveError("'matriz_preco' not found in the RSC payload (8330 bytes)")
+        raise NoMatch("gone before we got there")
+
+    monkeypatch.setattr(buy_mod, "_execute_buy", _blind_on_the_first_night)
+
+    with pytest.raises(AutobuyError, match="matriz_preco"):
+        buy_mod.cmd_autobuy(args)
+
+    assert seen == ["n", "z"], (
+        f"the blind night must not hide the later one -- reached {seen}")
+    assert runner._read_state().get("fired", {}) == {}, "nothing was ordered"
+    raw = json.loads((targets / "n.json").read_text(encoding="utf-8"))
+    assert raw["buy"]["enabled"] is True, "a pre-click failure must leave the night armed"

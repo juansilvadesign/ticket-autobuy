@@ -284,6 +284,22 @@ def cmd_autobuy(args) -> int:
                 # most likely outcome on a fast market, and an ordinary no-op.
                 print("   gone before we got there; nothing ordered", flush=True)
                 continue
+            except ResolveError as e:
+                # ⛔🔴 Observed 2026-09-05: this used to escape the loop to `main()`
+                # (exit 2) and kill the WHOLE run at the first blind night. Targets
+                # iterate in sorted() order, so 04/09 -- left armed at a temporary
+                # R$1.000 ceiling and blind since its event ended -- matched at R$297
+                # every minute and aborted 468 consecutive runs before 05/09..13/09
+                # were ever evaluated. `autobuy.log` held ZERO lines for any of them
+                # while a 40-minute R$198,00 dip came and went on 2026-09-04.
+                # Collected here exactly like a blind HISTORY read: the `if blind:`
+                # raise below still makes the run shout, and the LATER nights still
+                # get looked at.
+                # ⭐ No bookkeeping is owed and the night stays armed -- `_resolve`
+                # runs BEFORE the browser, so this is strictly pre-click and no
+                # reservation can exist.
+                blind.append(f"{cfg.target_id}: {e}")
+                continue
             except SessionError:
                 # ⭐ THE path that actually fires. `session.require()` above already
                 # passed -- it is a file check -- and the live probe inside
