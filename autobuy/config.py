@@ -61,6 +61,7 @@ class BuyConfig:
     cidade: str | None
     max_price_cents: int
     quantity: int
+    min_available: int
     sectors: list[str] | None
     entry_classes: list[str] | None
     min_price_cents: int
@@ -112,6 +113,13 @@ def load(path: str | Path, *, require_armed: bool = True) -> BuyConfig:
     quantity = buy.get("quantity", 1)
     if not isinstance(quantity, int) or isinstance(quantity, bool) or quantity < 1:
         raise ConfigError(f"{path}: buy.quantity must be an integer >= 1, got {quantity!r}")
+    # ⭐ Depth floor -- see `listing.choose`. Defaults to `quantity`, i.e. OFF, because
+    # raising it silently would change which listing every existing target buys.
+    min_available = buy.get("min_available", quantity)
+    if (not isinstance(min_available, int) or isinstance(min_available, bool)
+            or min_available < 1):
+        raise ConfigError(f"{path}: buy.min_available must be an integer >= 1, "
+                          f"got {min_available!r}")
 
     params = raw.get("params") or {}
     for key in ("event_slug", "data_millis", "evento_local"):
@@ -127,6 +135,7 @@ def load(path: str | Path, *, require_armed: bool = True) -> BuyConfig:
         cidade=params.get("cidade"),
         max_price_cents=max_cents,
         quantity=quantity,
+        min_available=min_available,
         sectors=_as_list(buy.get("sector"), f"{path}: buy.sector"),
         entry_classes=_as_list(buy.get("entry_class"), f"{path}: buy.entry_class"),
         min_price_cents=min_cents,

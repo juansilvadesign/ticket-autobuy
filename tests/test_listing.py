@@ -285,6 +285,16 @@ class _FakeLocator:
         raise AssertionError("a real .click() would hit the greyout overlay and time out")
 
 
+class _FakeRowCard:
+    """What an ancestor climb from the status label reaches: the clickable row card.
+    Exposes only what `_open_order` uses -- `count`, `last`, `element_handle`."""
+    def __init__(self, handle): self._h = handle
+    def count(self): return 1
+    @property
+    def last(self): return self
+    def element_handle(self): return self._h
+
+
 class _FakeOrderPage:
     """The REAL order screen of 2026-09-02: the Pix code is in NO DOM shape at all --
     it exists only on the clipboard, written by the `#btn_copy` handler."""
@@ -380,13 +390,22 @@ class _FakeCheckoutThenOrders:
         return _FakeLocator(present=False)
     def evaluate(self, js, arg=None):
         if "readText" in js: return _REAL_PIX if self.on_orders else ""
+        if "click" in js and arg == "row":
+            # ⭐ Only the ROW CARD opens an order.
+            self.url = "https://buyticketbrasil.com/ingressos?pagina=comprado&ID=abc"
         return None
     def get_by_text(self, text, **k):
         page = self
         class _M:
             def __init__(self, t): self.t = t
             def is_visible(self): return page.on_orders or self.t == "Comprados"
-            def click(self): page.clicked.append(self.t); page.on_orders = True
+            def click(self):
+                # ⛔ Clicking the STATUS LABEL navigates NOWHERE. The old fake made it
+                # navigate, and that invented rule is exactly why the real bug shipped:
+                # the suite was green against a site that does not behave this way.
+                if self.t == "Comprados":
+                    page.clicked.append(self.t); page.on_orders = True
+            def locator(self, _xp): return _FakeRowCard("row")
         class _L:
             def all(self): return [_M(text)]
         return _L()
@@ -406,7 +425,8 @@ def test_the_code_is_fetched_from_the_orders_page_not_the_checkout(monkeypatch):
     got = checkout._pix_from_orders_page(page)
     assert got["pix_code"] == _REAL_PIX
     assert "Comprados" in page.clicked
-    assert got["order_url"].endswith("/ingressos")
+    assert "pagina=comprado" in got["order_url"], \
+        "order_url must name the ORDER that was opened, not the list page"
 
 
 def test_wait_for_returns_none_rather_than_hanging():
@@ -434,6 +454,10 @@ class _FakeOrdersList:
     def evaluate(self, js, arg=None):
         if "readText" in js:
             return _REAL_PIX if self.opened == self.payable_index else ""
+        if "click" in js and isinstance(arg, tuple) and arg[0] == "row":
+            page_i = arg[1]
+            self.opened = page_i
+            self.url = f"https://buyticketbrasil.com/ingressos?ID=order{page_i}"
         return None
     def get_by_text(self, text, **k):
         page = self
@@ -441,9 +465,8 @@ class _FakeOrdersList:
             def __init__(self, i): self.i = i
             def is_visible(self): return True
             def click(self):
-                if text == "Aguardando pagamento":
-                    page.opened = self.i
-                    page.url = f"https://buyticketbrasil.com/ingressos?ID=order{self.i}"
+                pass          # ⛔ the LABEL is inert; only the row card opens an order
+            def locator(self, _xp): return _FakeRowCard(("row", self.i))
         class _L:
             def all(self):
                 return [_Row(i) for i in range(page.n_pending)] \
@@ -477,3 +500,135 @@ def test_no_payable_order_anywhere_returns_empty(monkeypatch):
     assert checkout._pix_from_orders_page(
         _FakeOrdersList(payable_index=99), timeout_ms=300,
         button_timeout_ms=200) == {}
+
+
+# ------------------------------------------------------- the greyout overlay
+
+class _FakeOverlayPage:
+    """A Bubble screen whose `greyout` overlay clears after N probes. ⛔ The control
+    underneath reports `is_visible() == True` the whole time -- that is exactly why
+    `settle()` does not catch this and a probe reads the control as absent."""
+    def __init__(self, clears_after=3):
+        self.clears_after, self.probes, self.js_clicked = clears_after, 0, False
+        self.url = "https://buyticketbrasil.com/datas/x?p=2"
+    def locator(self, sel):
+        page = self
+        busy = self.probes < self.clears_after
+        if "greyout" in sel:
+            page.probes += 1
+            class _G:
+                def count(self): return 1
+                def nth(self, i): return self
+                def is_visible(self): return busy
+            return _G()
+        return _FakeLocator(present=False)
+    def wait_for_timeout(self, _ms): pass
+    def evaluate(self, js, arg=None):
+        if "click" in js: self.js_clicked = True
+        return None
+
+
+def test_a_visible_greyout_is_NOT_an_idle_signal():
+    """⛔🔴 THE measurement that killed the gate. Live on checkout screen 2, 2026-09-04:
+    FIVE `greyout` elements, the fifth PERMANENTLY visible. A gate on "any greyout is
+    visible" never returns -- it spent its whole 30 s budget on every screen, took the
+    run from 49 s to 117 s, and the listing was sold by the time it clicked buy.
+
+    ⭐ The rule this pins: "an overlay exists" and "this button is unclickable" are
+    different claims, and only the second one matters. `_greyout_state` is a DIAGNOSTIC;
+    interception is measured by Playwright's actionability check, which `_click_through`
+    already acts on. Never turn this back into a gate.
+    """
+    page = _FakeOverlayPage(clears_after=10**9)
+    assert any(checkout._greyout_state(page)), "the stuck overlay must be observable"
+    src = (ROOT / "autobuy" / "checkout.py").read_text(encoding="utf-8")
+    body = src.split("def run_checkout(")[1]
+    assert "_wait_for_idle" not in src, "the mismeasuring gate must stay deleted"
+    assert "_greyout_state(" not in body, "diagnostics must not gate the checkout"
+
+
+def test_greyout_state_is_readable_and_never_raises():
+    class _Broken:
+        url = "x"
+        def locator(self, sel): raise RuntimeError("detached")
+    assert checkout._greyout_state(_Broken()) == []
+
+
+def test_no_click_is_ever_force_dispatched_in_the_checkout():
+    """⛔🔴 Measured 2026-09-04. A JS `element.click()` fallback was added to get past
+    the `greyout` overlay and is measurably WORSE than a plain click: forcing past
+    Playwright's actionability check advanced the flow through controls the app had not
+    accepted. Three live runs produced NO ORDER at all -- one looped all 8 screens at a
+    uniform 16.6 s and never reached a final control. The one run that ever created an
+    order (#6999ZUKS) used plain clicks.
+
+    ⭐ The rule: a real click that fails is INFORMATION. Overriding it does not fix the
+    failure, it relocates it somewhere less legible -- here, into a checkout that walks
+    to the end and silently reserves nothing.
+    """
+    src = (ROOT / "autobuy" / "checkout.py").read_text(encoding="utf-8")
+    body = src.split("def run_checkout(")[1]
+    assert "_click_through" not in src, "the forced-click helper must stay deleted"
+    assert "e.click()" not in body, "no JS dispatch inside the checkout flow"
+    assert "cont.click(timeout=" in body, "the plain click must fail FAST, not in 30s"
+
+
+def test_the_order_creating_click_stays_plain():
+    """⛔ The button that CREATES the order must never be forced: a second dispatch is
+    a second reservation."""
+    src = (ROOT / "autobuy" / "checkout.py").read_text(encoding="utf-8")
+    body = src.split("def run_checkout(")[1]
+    assert "final.click()" in body
+
+
+
+
+def test_a_stale_orders_code_is_REFUSED(monkeypatch):
+    """⛔🔴 2026-09-04, and it reached the user. The R$308 buy was refused by the site
+    (an unpaid hold still existed on the account), so no new order was created -- but
+    the expired #1600NB9C still read "Aguardando pagamento" and still had a live
+    `#btn_copy`. The reader opened it, took its payload, and the run reported RESERVED
+    with a code the bank then rejected. Identical `order_url` and identical Pix payload
+    to the previous run were the only tell.
+
+    ⭐ A returned code is worthless unless you can say WHICH order it belongs to.
+    """
+    monkeypatch.setattr(checkout, "_goto", lambda pg, url, **k: pg.goto(url))
+    monkeypatch.setattr(checkout, "_first_visible",
+                        lambda pg, text, limit=12: next(
+                            (m for m in pg.get_by_text(text).all() if m.is_visible()), None))
+    page = _FakeOrdersList(payable_index=0)
+    monkeypatch.setattr(checkout, "pending_order_ids", lambda pg: {"STALE001"})
+    assert checkout._pix_from_orders_page(
+        page, timeout_ms=300, button_timeout_ms=200,
+        exclude_ids={"STALE001"}) == {}, "a pre-existing order must never be read"
+
+
+def test_a_NEW_order_is_still_accepted(monkeypatch):
+    """⚠️ The permit leg: the guard must not refuse the order we just created."""
+    monkeypatch.setattr(checkout, "_goto", lambda pg, url, **k: pg.goto(url))
+    monkeypatch.setattr(checkout, "_first_visible",
+                        lambda pg, text, limit=12: next(
+                            (m for m in pg.get_by_text(text).all() if m.is_visible()), None))
+    page = _FakeOrdersList(payable_index=0)
+    monkeypatch.setattr(checkout, "pending_order_ids", lambda pg: {"STALE001", "NEW002"})
+    got = checkout._pix_from_orders_page(page, timeout_ms=300, button_timeout_ms=200,
+                                         exclude_ids={"STALE001"})
+    assert got["pix_code"] == _REAL_PIX
+
+
+def test_the_checkout_does_NOT_navigate_away_before_buying():
+    """⛔🔴 A pre-flight /ingressos snapshot was added and removed within the hour on
+    2026-09-04: its round trip timed out and retried, taking screen 1 from ~4 s to
+    102.73 s and the whole run from 71 s to 128.41 s. The run that actually won a ticket
+    took 71 s, and every second between the live re-resolve and the order-creating click
+    is a second the listing can be sold in. A guard that doubles the exposure window is
+    not a guard.
+
+    ⭐ The stale-order risk is handled as a PRECONDITION instead -- never buy while an
+    unpaid hold is pending. See `_pix_from_orders_page`, and the exclude_ids path kept
+    there for a caller that already knows.
+    """
+    src = (ROOT / "autobuy" / "checkout.py").read_text(encoding="utf-8")
+    pre = src.split("def run_checkout(")[1].split("for step in range")[0]
+    assert "ORDERS_URL" not in pre, "no orders-page navigation before the checkout loop"

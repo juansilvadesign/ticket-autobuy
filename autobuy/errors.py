@@ -56,3 +56,17 @@ class CheckoutError(AutobuyError):
     checkout may or may not have created a reservation, and a blind retry is how one
     intended ticket becomes two. Re-read the state, then decide by hand.
     """
+
+
+class OrderMayExistError(CheckoutError):
+    """Raised ONLY after the order-creating click, when the Pix code could not be read.
+
+    ⛔ A distinct type, not a message, because the caller has to bookkeep differently:
+    a reservation may be live, so the ledger and the disarm must fire. Every OTHER
+    `CheckoutError` (nothing rendered, no control found, ran out of screens) happens
+    strictly BEFORE the click and must NOT take a night out of play.
+
+    Observed 2026-09-04: string-blind handling of `CheckoutError` recorded and disarmed
+    11/09 for "checkout did not reach a final control in 8 screens" -- a pre-click
+    failure. No order existed; the night was simply lost for the evening.
+    """

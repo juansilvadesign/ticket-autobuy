@@ -161,7 +161,8 @@ def choose(candidates: list[Candidate], *, max_price_cents: int,
            quantity: int = 1,
            sectors: list[str] | None = None,
            entry_classes: list[str] | None = None,
-           min_price_cents: int = 0) -> Candidate:
+           min_price_cents: int = 0,
+           min_available: int = 0) -> Candidate:
     """The cheapest candidate satisfying the buy config. Raises `NoMatch` if none is.
 
     `min_price_cents` is the anomaly floor and it is OPT-IN, defaulting to off. In
@@ -170,6 +171,19 @@ def choose(candidates: list[Candidate], *, max_price_cents: int,
     RESERVES, and a human pays the Pix. So an anomalous R$ 66,00 row is a decision to
     put in front of you, not a trap to filter out -- you look at it and either pay or
     let the 30-minute hold lapse. Set it if you would rather not be woken for one.
+
+    ⭐ `min_available` is a DEPTH floor, and it is the difference between a tool that
+    buys and a lottery. Measured 2026-09-04 across three live runs on event day:
+
+        Gramado || Inteira        qty 168  -> ORDER CREATED (#6999ZUKS)
+        Gramado || Meia Professor qty   4  -> no order
+        Gramado || Meia Idoso     qty   1  -> no order
+
+    The checkout takes ~50-80 s from the live re-resolve to the order-creating click,
+    and a 1-4 unit row on a hot event day is simply GONE inside that window: the click
+    lands on a listing that no longer exists, the app bounces back to the event page,
+    and nothing is reserved. Depth was already the TIE-BREAK below; the measurement
+    says it has to be a FILTER, because the cheapest row is usually the thinnest one.
     """
     pool = [c for c in candidates if c.price_cents <= max_price_cents]
     if min_price_cents:
@@ -180,14 +194,14 @@ def choose(candidates: list[Candidate], *, max_price_cents: int,
     if entry_classes:
         want = {e.casefold() for e in entry_classes}
         pool = [c for c in pool if c.entry_class.casefold() in want]
-    pool = [c for c in pool if c.quantity >= quantity]
+    pool = [c for c in pool if c.quantity >= max(quantity, min_available)]
 
     if not pool:
         raise NoMatch(
             f"no listing at or under {max_price_cents} centavos"
             + (f" in {sectors}" if sectors else "")
             + (f" of class {entry_classes}" if entry_classes else "")
-            + f" with at least {quantity} available"
+            + f" with at least {max(quantity, min_available)} available"
         )
     # Cheapest first; ties broken by the deeper stock, which is the one less likely to
     # be gone by the time the browser reaches it.

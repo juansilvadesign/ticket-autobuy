@@ -191,8 +191,10 @@ def candidate_under_ceiling(readings: list[dict], cfg) -> dict | None:
             continue
         if cfg.min_price_cents and price < cfg.min_price_cents:
             continue
-        if (r.get("quantity") or 0) < cfg.quantity:
-            continue
+        if (r.get("quantity") or 0) < max(cfg.quantity, cfg.min_available):
+            continue                      # ⭐ same depth floor as `listing.choose`:
+            # triggering on a 1-unit row the chooser will reject only spends a browser
+            # launch on a guaranteed NoMatch, and every launch is an antifraud event.
         extra = r.get("extra") or {}
         if cfg.sectors and (extra.get("sector") or "").lower() not in \
                 {s.lower() for s in cfg.sectors}:

@@ -35,7 +35,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .errors import CheckoutError, SessionError
+from .errors import CheckoutError, OrderMayExistError, SessionError
 from . import session as session_mod
 
 # ⚠️ buyticketbrasil takes ~12s to reach domcontentloaded from this machine, measured
@@ -582,6 +582,25 @@ def _wait_for(page, predicate, *, timeout_ms: int = 45_000, poll_ms: int = 250):
     return None
 
 
+def pending_order_ids(page) -> set[str]:
+    """Every order id currently visible in Comprados, e.g. {"1600NB9C", ...}.
+
+    ⛔ Snapshotted BEFORE the checkout runs so the code reader can tell THIS run's order
+    from a leftover one. Without it the reader is guessing, and on 2026-09-04 it guessed
+    wrong in the worst possible direction: the R$308 buy was refused (an unpaid hold
+    still existed), the fallback opened the EXPIRED #1600NB9C -- which still read
+    "Aguardando pagamento" and still had a live `#btn_copy` -- and returned its stale
+    payload as the new order's code. The run reported success and the bank refused the
+    code. A returned code is worthless unless you can say WHICH order it belongs to.
+    """
+    import re
+    try:
+        return set(re.findall(r"#([0-9A-Z]{6,10})",
+                              page.evaluate("document.body.innerText") or ""))
+    except Exception:                                      # noqa: BLE001
+        return set()
+
+
 def _pending_rows(page) -> list:
     """Every visible "Aguardando pagamento" row in Comprados, newest first."""
     out = []
@@ -594,9 +613,47 @@ def _pending_rows(page) -> list:
     return out
 
 
+#: Ancestor ladder from the "Aguardando pagamento" LABEL up to the clickable row card.
+#: Narrowest first; the label itself is never clickable.
+_ROW_ANCESTORS = ("xpath=ancestor::*[self::a or self::button][1]",
+                  "xpath=ancestor::*[position()<=8]")
+
+
+def _open_order(page, status_el) -> bool:
+    """Open the ORDER the given "Aguardando pagamento" label belongs to.
+
+    ⛔ THE bug behind the first order that was actually paid (#6999ZUKS, 2026-09-04).
+    `_pending_rows` yields the status LABEL, and clicking a label navigates NOWHERE --
+    so the caller opened no order, `#btn_copy` never appeared, every candidate was
+    skipped, and it returned `{}` over a live R$220 reservation. The code then had to
+    be recovered by hand from this very page. Climb to the row card and click THAT.
+
+    ⚠️ JS-clicked for the same reason `_pix_from_clipboard` is: a `greyout` div sits
+    above the row and intercepts pointer events, so Playwright's `.click()` burns its
+    timeout against an element it has just reported visible, enabled and stable.
+
+    Returns True only if the page actually NAVIGATED -- "I clicked something" is not
+    evidence that an order opened.
+    """
+    before = page.url
+    for xp in _ROW_ANCESTORS:
+        try:
+            cand = status_el.locator(xp)
+            if not cand.count():
+                continue
+            page.evaluate("e => e.click()", cand.last.element_handle())
+            page.wait_for_timeout(1500)
+            if page.url != before:
+                return True
+        except Exception:                                  # noqa: BLE001
+            continue
+    return False
+
+
 def _pix_from_orders_page(page, *, timeout_ms: int = 45_000,
                           max_orders: int = 3,
-                          button_timeout_ms: int = 12_000) -> dict:
+                          button_timeout_ms: int = 12_000,
+                          exclude_ids: set[str] | None = None) -> dict:
     """Navigate to the ORDER and read its code.
 
     ⭐ THE correction from three real runs. Clicking the final "Comprar agora" does NOT
@@ -631,12 +688,20 @@ def _pix_from_orders_page(page, *, timeout_ms: int = 45_000,
                 return {}                      # nothing pending at all -- no order
             if idx >= len(rows):
                 return {}                      # exhausted the pending orders
-            rows[idx].click()
+            if not _open_order(page, rows[idx]):
+                continue                       # the row never opened; try the next one
             # A shorter budget per candidate: a lapsed order will never grow the button,
             # and spending the full 45 s on each would blow the 10-minute hold.
             if _wait_for(page, lambda pg: pg.locator(PIX_COPY_BUTTON).count(),
                          timeout_ms=button_timeout_ms) is None:
                 continue
+            # ⛔ Refuse a code from an order that already existed before this run.
+            # A lapsed hold keeps its "Aguardando pagamento" label and its working copy
+            # button for minutes, so "it had a code" does NOT mean "it is ours".
+            if exclude_ids:
+                here = pending_order_ids(page)
+                if here and here <= exclude_ids:
+                    continue                   # a pre-existing order; keep looking
             got = _extract_pix(page)
             if got:
                 got["order_url"] = page.url
@@ -678,6 +743,36 @@ def _extract_pix(page) -> dict:
     return _pix_from_clipboard(page)
 
 
+#: Bubble's "the app is busy" overlay. It is a real, visible div stacked ABOVE the
+#: controls, which is why it defeats both halves of a click: `is_visible()` on the
+#: button underneath still answers True, and Playwright's actionability check then burns
+#: its full 30 s reporting "<div class=greyout> intercepts pointer events".
+GREYOUT_SEL = "div.greyout, div[class*='greyout']"
+
+
+def _greyout_state(page) -> list[bool]:
+    """Visibility of each `greyout` element. ⛔ DIAGNOSTIC ONLY -- never a gate.
+
+    ⛔ Measured live 2026-09-04, and it is why an "wait until no greyout is visible"
+    gate must never be reinstated: on checkout screen 2 the page carries **5** matching
+    elements and the fifth is **permanently visible**. It is not the busy overlay. A
+    gate built on "any greyout is visible" therefore never returns, burns its whole
+    30 s budget on EVERY screen, and turned a 49 s run into a 117 s one -- which lost
+    the listing outright, because the exposure window between the live re-resolve and
+    the order-creating click is the whole reason `BUDGET_S` is 60 s.
+
+    ⭐ "An overlay exists" and "this button is unclickable" are different claims. Only
+    the second one matters, only Playwright's own actionability check measures it, and
+    interception is measured by Playwright's own actionability check, which the
+    plain `cont.click(timeout=...)` already reports. Measure what you gate on.
+    """
+    try:
+        loc = page.locator(GREYOUT_SEL)
+        return [loc.nth(i).is_visible() for i in range(min(loc.count(), 8))]
+    except Exception:                                      # noqa: BLE001
+        return []
+
+
 def run_checkout(page, person: Person, *, dry_run: bool = True,
                  expect_cents: int | None = None,
                  out_dir: Path | None = None, clock=None) -> dict:
@@ -689,6 +784,9 @@ def run_checkout(page, person: Person, *, dry_run: bool = True,
         p=2  select PIX, "Continuar"
         p=2  "E-mail do recebedor", "Continuar"     (progressive disclosure, same URL)
         p=2  9 personal fields, "Continuar"
+        p=2  "Continuar"                            <- ⚠️ ADDED by the site; re-mapped
+                                                       live 2026-09-04. The flow is SIX
+                                                       screens now, not five.
         p=2  "Comprar agora"                        <- CREATES THE ORDER
 
     The screens share one URL and accumulate, so the flow is driven by which controls
@@ -698,6 +796,18 @@ def run_checkout(page, person: Person, *, dry_run: bool = True,
     if out_dir:
         out_dir.mkdir(parents=True, exist_ok=True)
 
+    # ⛔ NO pre-flight snapshot of existing orders here, deliberately. It was tried
+    # 2026-09-04 and removed the same hour: the extra /ingressos round trip TIMED OUT
+    # and retried, taking screen 1 from ~4 s to 102 s and the run from 71 s to 128 s.
+    # The run that actually won a ticket took 71 s, and every second between the live
+    # re-resolve and the order-creating click is a second the listing can be sold in.
+    # A guard that doubles the exposure window is not a guard.
+    #
+    # ⭐ The stale-order risk it addressed is a PRECONDITION, not an in-flight check:
+    # never buy while an unpaid hold is pending (`/ingressos` -> Comprados). That is the
+    # rule Juan stated at the outset, and violating it is what created the trap -- the
+    # site REFUSED the new order because a hold still existed, and the reader then
+    # returned the stale order's payload as if it were the new one.
     for step in range(1, 9):
         elements = settle(page)
         if clock is not None:
@@ -712,7 +822,16 @@ def run_checkout(page, person: Person, *, dry_run: bool = True,
 
         cont = _first_visible(page, "Continuar")
         if cont is not None:
-            cont.click()
+            # ⛔ A PLAIN click, and a short one. A JS `element.click()` fallback was
+            # tried 2026-09-04 and is measurably worse: forcing past the actionability
+            # check made the flow advance through controls the app had not accepted --
+            # three live runs produced no order at all, one of them looping all 8
+            # screens at a uniform 16.6 s. A real click that fails is INFORMATION;
+            # overriding it just moves the failure somewhere less legible.
+            # ⚠️ 10 s, not the 30 s default: an intercepted click should end the run
+            # fast so the next cron minute can retry, rather than eat the budget that
+            # decides whether the listing still exists when we click buy.
+            cont.click(timeout=10_000)
             page.wait_for_timeout(2000)
             continue
 
@@ -781,7 +900,7 @@ def run_checkout(page, person: Person, *, dry_run: bool = True,
     if not pix:
         # ⛔ Never retried and never swallowed. A retry would risk a SECOND reservation,
         # and a swallow would leave a real, paid-for-able order with no code to pay it.
-        raise CheckoutError(
+        raise OrderMayExistError(
             f"AN ORDER MAY EXIST but no Pix code could be read.\n"
             f"⚠️ Find it at {ORDERS_URL} -> the 'Comprados' tab, open the order and "
             f"press 'Copiar código'.\n"

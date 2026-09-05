@@ -33,7 +33,8 @@ sys.path.insert(0, str(HERE))
 from autobuy import (checkout, config, listing, notify, runner,        # noqa: E402
                      session, timing)
 from autobuy.errors import (AutobuyError, CheckoutError, ConfigError,   # noqa: E402
-                            NoMatch, ResolveError, SessionError)
+                            NoMatch, OrderMayExistError, ResolveError,
+                            SessionError)
 
 
 def _fmt_brl(cents: int) -> str:
@@ -68,6 +69,7 @@ def _resolve(cfg) -> tuple[listing.Candidate, str]:
         sectors=cfg.sectors,
         entry_classes=cfg.entry_classes,
         min_price_cents=cfg.min_price_cents,
+        min_available=cfg.min_available,
     )
     return best, url
 
@@ -89,7 +91,8 @@ def cmd_resolve(args) -> int:
         best = listing.choose(candidates, max_price_cents=cfg.max_price_cents,
                               quantity=cfg.quantity, sectors=cfg.sectors,
                               entry_classes=cfg.entry_classes,
-                              min_price_cents=cfg.min_price_cents)
+                              min_price_cents=cfg.min_price_cents,
+                              min_available=cfg.min_available)
     except NoMatch as e:
         print(f"\nnothing armed: {e}")
         return 0                       # data, not failure -- the ordinary outcome
@@ -286,6 +289,24 @@ def cmd_autobuy(args) -> int:
                 # passed -- it is a file check -- and the live probe inside
                 # `open_listing` is where a logged-out session is really discovered.
                 _alert_session_dead(state, cfg, hit)
+                raise
+            except OrderMayExistError:
+                # ⛔ Raised AFTER the order-creating click ("AN ORDER MAY EXIST but no
+                # Pix code could be read"), so a live reservation may exist. The ledger
+                # and the disarm therefore belong HERE too, not only on the happy path.
+                # Recording only on success is exactly how the next cron minute buys a
+                # SECOND ticket for a night that already has one -- observed live
+                # 2026-09-04, when this branch left the target armed on a 1-minute cron.
+                # ⚠️ Deliberately fails CLOSED: if it turns out no order was created,
+                # clearing one ledger key by hand is cheap; a duplicate reservation is
+                # not.
+                state = runner.record_fired(
+                    state, cfg.target_id, price_cents=hit["price_cents"],
+                    item=hit["item"],
+                    order_url="UNCONFIRMED -- the checkout raised after the final "
+                              "click. Verify at /ingressos -> Comprados before re-arming.")
+                runner._write_state(state)
+                runner.disarm_target(tpath)
                 raise
             finally:
                 print("\n" + clock.report(budget_s=BUDGET_S), flush=True)

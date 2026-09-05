@@ -354,3 +354,87 @@ def test_a_dip_that_evaporated_is_NOT_a_dead_session(tmp_path, monkeypatch):
 
     assert buy_mod.cmd_autobuy(args) == 0
     assert not sent, "an evaporated dip must never fire the dead-session alert"
+
+
+def test_a_checkout_that_raises_AFTER_the_click_still_records_and_disarms(
+        tmp_path, monkeypatch):
+    """⛔🔴 Observed live 2026-09-04. `CheckoutError: AN ORDER MAY EXIST but no Pix code
+    could be read` is raised AFTER the order-creating click, so a real reservation may
+    be live -- and the old code recorded the ledger only on the SUCCESS path. The night
+    was left armed, with no ledger entry, on a cron that fires every minute.
+
+    ⚠️ It fails CLOSED on purpose: clearing one ledger key by hand when no order turned
+    out to exist is cheap; a duplicate reservation is not.
+    """
+    from autobuy.errors import OrderMayExistError
+    buy_mod, args, sent = _autobuy_world(tmp_path, monkeypatch)
+
+    def _raises_after_the_click(*a, **k):
+        raise OrderMayExistError("AN ORDER MAY EXIST but no Pix code could be read.")
+    monkeypatch.setattr(buy_mod, "_execute_buy", _raises_after_the_click)
+
+    with pytest.raises(OrderMayExistError):
+        buy_mod.cmd_autobuy(args)
+
+    fired = runner._read_state().get("fired", {})
+    assert "n" in fired, "a possible reservation must be in the ledger"
+    assert "UNCONFIRMED" in fired["n"]["order_url"]
+    raw = json.loads((tmp_path / "targets" / "n.json").read_text(encoding="utf-8"))
+    assert raw["buy"]["enabled"] is False, "the night must be disarmed too"
+    assert not sent, "a checkout failure is not a dead session; no alert"
+
+
+# ------------------------------------------------------------------ depth floor
+
+def test_the_depth_floor_skips_a_row_that_will_be_gone_before_the_click(tmp_path):
+    """⭐🔴 Measured 2026-09-04, three live runs on event day. The ONLY one that created
+    an order bought a 168-unit row; the 4-unit and 1-unit rows produced no order at all
+    -- the checkout takes ~50-80 s from the live re-resolve to the order-creating click,
+    and a thin row on a hot market is gone inside that window. The chooser always picks
+    the CHEAPEST row, which is usually the thinnest, so depth has to be a filter."""
+    from autobuy import listing
+    def _c(price, qty, klass):
+        return listing.Candidate(sector="Gramado", entry_class=klass,
+                                 price_cents=price, quantity=qty, id_ref="i")
+    thin, deep = _c(22000, 1, "Meia Idoso"), _c(30800, 161, "Inteira")
+    # off by default: the cheapest wins, however thin
+    assert listing.choose([thin, deep], max_price_cents=10**9) is thin
+    # with the floor: the row that will still exist when the browser arrives
+    assert listing.choose([thin, deep], max_price_cents=10**9,
+                          min_available=20) is deep
+
+
+def test_the_depth_floor_defaults_to_off(tmp_path):
+    """⚠️ Raising it silently would change which listing every existing target buys."""
+    cfg, _ = _cfg(tmp_path)
+    assert cfg.min_available == cfg.quantity == 1
+
+
+def test_a_nonsense_depth_floor_refuses_to_load(tmp_path):
+    _, t = _cfg(tmp_path)
+    raw = json.loads(t.read_text(encoding="utf-8"))
+    raw["buy"]["min_available"] = 0
+    t.write_text(json.dumps(raw), encoding="utf-8")
+    with pytest.raises(ConfigError, match="min_available"):
+        config.load(t)
+
+
+def test_a_PRE_click_checkout_failure_does_NOT_take_the_night_out_of_play(
+        tmp_path, monkeypatch):
+    """⛔🔴 Observed 2026-09-04: handling `CheckoutError` blind recorded and disarmed
+    11/09 for "checkout did not reach a final control in 8 screens" -- a failure that
+    happens strictly BEFORE the order-creating click. No order existed, and the night
+    was lost for the evening anyway. Only `OrderMayExistError` may bookkeep."""
+    from autobuy.errors import CheckoutError
+    buy_mod, args, sent = _autobuy_world(tmp_path, monkeypatch)
+
+    def _fails_before_the_click(*a, **k):
+        raise CheckoutError("checkout did not reach a final control in 8 screens")
+    monkeypatch.setattr(buy_mod, "_execute_buy", _fails_before_the_click)
+
+    with pytest.raises(CheckoutError):
+        buy_mod.cmd_autobuy(args)
+
+    assert runner._read_state().get("fired", {}) == {}, "nothing was ordered"
+    raw = json.loads((tmp_path / "targets" / "n.json").read_text(encoding="utf-8"))
+    assert raw["buy"]["enabled"] is True, "the night must stay armed for the retry"
