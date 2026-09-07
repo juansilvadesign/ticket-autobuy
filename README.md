@@ -22,7 +22,7 @@ buys. See [`CLAUDE.md`](CLAUDE.md) for why that split is load-bearing, and
 | headless | ✅ verified, and *faster* than headed |
 | the final click + reading the Pix code | 🔲 unverified — needs one real purchase |
 
-27 tests green.
+114 tests green.
 
 ## Install
 
