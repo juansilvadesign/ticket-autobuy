@@ -184,8 +184,10 @@ session, which killed a live R$ 165,00 dip on 06/09 at the login wall.
       4×, and a test count is exactly the kind of number that is believed without being
       re-run. ⚠️ It is hand-maintained and will go stale again — re-read it from
       `pytest -q`, never from the last thing a doc said.
-- [ ] **SOAD — the next event** (Maracanã, 15/01/2027). ✅ **Every decision is now
-      made** and the watch half has shipped; see `ROADMAP.md`. ⛔ The buy half stays
+- [ ] ⏸ **SOAD — PARKED 2026-09-07 until Rock in Rio is finished.** Both halves now
+      wait on the same event, so it resumes in one pass after the 11/09 hard stop —
+      the same pass that deletes the five dated cron lines. ✅ **Every decision is
+      already made** and the watch half is written; see `ROADMAP.md`. ⛔ The buy half stays
       **unarmed until after 11/09** — one ~2 h session, and 11/09 gets it.
       ⭐ Both open questions resolved themselves rather than needing a compromise:
       `critical_price` at R$400 is coherent because `lowest_ever` is off, so the anomaly

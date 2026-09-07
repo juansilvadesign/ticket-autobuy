@@ -26,9 +26,11 @@ Full detail in `README.md`; the open items are in `TASKS.md`.
 ## Next — a second event
 
 **SOAD** — *System of a Down + Faith No More*, Maracanã, **15/01/2027**, sector
-`Pista Premium Itaú Personalité`. The **watch half shipped 2026-09-06** as
-`../price-watcher/targets/soad2027-01-15.json` (watch-only, verified live: 14 listings,
-2 after filters). What remains here is the buy half.
+`Pista Premium Itaú Personalité`. The watch half shipped 2026-09-06 as
+`../price-watcher/targets/soad2027-01-15.json` (verified live: 14 listings, 2 after
+filters) and was **⏸ PARKED 2026-09-07** — `enabled: false` until Rock in Rio is
+finished. ⛔ **Both halves are now waiting on the same event**, so the whole of SOAD
+resumes in one pass after the 11/09 16:00 BRT hard stop.
 
 - [ ] **Create script for SOAD** — ⛔ **deliberately NOT armed until after 11/09.**
       The two tools share **one** browser session whose observed lifetime is ~2 h.
