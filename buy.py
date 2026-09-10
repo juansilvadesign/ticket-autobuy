@@ -217,6 +217,56 @@ def _alert_session_dead(state: dict, cfg, hit: dict) -> None:
             f"Nothing is being bought on any night until you do.")
 
 
+def _report_rejected(state: dict, cfg, readings: list[dict]) -> None:
+    """Say out loud that something was under the ceiling and still not bought.
+
+    ⛔🔴 The gap this closes cost two real windows. See `runner.rejected_under_ceiling`:
+    on 2026-09-06 and 2026-09-07 a R$198,00 listing sat under a R$200,00 ceiling across
+    7 and 10 polls, price-watcher alerted `CRITICAL -- under R$ 200,00` both times, and
+    this tool wrote NOTHING anywhere, because `min_available: 20` refused the row before
+    the first print statement. The ceiling was the number everyone was watching, so a
+    second filter silently holding the buy was invisible for three days.
+
+    ⭐ The log line is unconditional and the Telegram is throttled, in that order. The
+    log is what makes a run diagnosable afterwards; the message is what makes it noticed
+    at the time -- and only the second one can train a reader to mute the channel.
+    ⛔ Its OWN throttle key, per target: a chatty night must not eat the slot another
+    night needs, and `session_dead` must not eat this one.
+    ⚠️ A delivery failure is swallowed here, unlike the Pix code's. This rides on top of
+    a log line that has already landed, so the carve-out CLAUDE.md grants the QR image
+    applies -- an advisory must not become exit 3 and abort the remaining nights.
+    """
+    rejected = runner.rejected_under_ceiling(readings, cfg)
+    if not rejected:
+        return
+
+    def money(r: dict) -> str:
+        p = r.get("price_cents")
+        return _fmt_brl(p) if isinstance(p, int) and p > 0 else "?"
+
+    for r, reason in rejected:
+        print(f"⚠ {cfg.label}: {r.get('item')} at {money(r)} is AT OR UNDER the "
+              f"ceiling {_fmt_brl(cfg.max_price_cents)} and was NOT bought -- {reason}",
+              flush=True)
+
+    if not runner.should_alert(state, f"rejected:{cfg.target_id}"):
+        return
+    runner._write_state(state)
+    body = "\n".join(f"• {r.get('item')} at {money(r)} -- {why}"
+                     for r, why in rejected)
+    try:
+        notify.send_text(
+            os.environ.get("TELEGRAM_BOT_TOKEN", ""),
+            os.environ.get("TELEGRAM_CHAT_ID", ""),
+            f"⚠ ticket-autobuy did NOT buy a ticket that was under your ceiling\n\n"
+            f"{cfg.label}\nceiling {_fmt_brl(cfg.max_price_cents)}\n\n{body}\n\n"
+            f"The session and the poller are fine -- a buy FILTER refused it. Change it "
+            f"in the target's `buy` block, or accept the miss.")
+    except Exception as e:                                            # noqa: BLE001
+        print(f"   (could not deliver the rejected-row alert: "
+              f"{type(e).__name__}: {e})", flush=True)
+
+
 def cmd_autobuy(args) -> int:
     """Cron entry point. At most ONE reservation per invocation, one per night ever."""
     from datetime import datetime, timezone
@@ -260,6 +310,9 @@ def cmd_autobuy(args) -> int:
                 continue
             hit = runner.candidate_under_ceiling(readings, cfg)
             if hit is None:
+                # ⛔ NOT a plain `continue`. "Nothing matched" and "something matched
+                # your ceiling and a filter refused it" used to be the same silence.
+                _report_rejected(state, cfg, readings)
                 continue
 
             # ⛔ A dead session is the failure that silently DELETES this feature: the

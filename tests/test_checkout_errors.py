@@ -233,3 +233,41 @@ def test_the_HAPPY_path_still_returns_the_code(monkeypatch):
     assert out["dry_run"] is False
     assert out["pix_code"].startswith("00020126")
     assert out["source"] == "clipboard"
+
+
+def test_the_no_PIX_message_never_points_the_human_AWAY_from_the_orders_page(monkeypatch):
+    """⛔🔴 Printed verbatim on the real 2026-09-10 10:55 run, R$242,00:
+
+        ⚠️ Find it at https://buyticketbrasil.com/ingressos -> the 'Comprados' tab...
+        ⛔ NOT at https://buyticketbrasil.com/ingressos -- reopening a checkout URL...
+
+    Self-contradictory, and it points AWAY from the only page a live reservation is
+    visible on. Cause: the `⛔` line read `page.url` at RAISE time, and
+    `_pix_from_orders_page` had already navigated the page to `/ingressos` looking for
+    the code. The URL the warning means is the CHECKOUT one, which by then was gone.
+
+    ⭐ Same shape as `feedback_an_instrument_that_mutates_its_own_precondition`: the
+    step that gathers the evidence moved the thing the message was measuring.
+    """
+    page, final = _reaches_the_order(monkeypatch)
+    page.url = "https://buyticketbrasil.com/checkout?c_anuncio=abc&p=2"
+
+    def _hunts_the_orders_page(pg, **kw):
+        pg.url = checkout.ORDERS_URL            # exactly what the real one does
+        return None                             # ...and finds no payable hold
+    monkeypatch.setattr(checkout, "_extract_pix", lambda pg: None)
+    monkeypatch.setattr(checkout, "_pix_from_orders_page", _hunts_the_orders_page)
+
+    with pytest.raises(OrderMayExistError) as ei:
+        checkout.run_checkout(page, None, dry_run=False, expect_cents=13200)
+
+    assert final.clicks == 1, "the order-creating click DID happen"
+    lines = str(ei.value).splitlines()
+    find = next(ln for ln in lines if ln.startswith("⚠️ Find it at"))
+    away = next(ln for ln in lines if ln.startswith("⛔ NOT at"))
+
+    assert checkout.ORDERS_URL in find, "must still send the human to Comprados"
+    assert checkout.ORDERS_URL not in away, (
+        "the ⛔ line must never name the orders page -- that is the one place the "
+        f"reservation is visible. Got: {away!r}")
+    assert "checkout?c_anuncio=abc" in away, "it must name the CHECKOUT url instead"

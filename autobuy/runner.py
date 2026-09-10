@@ -175,6 +175,52 @@ def latest_readings(history_path: Path, *, now: datetime | None = None) -> list[
     return [r for r in rows if r.get("captured_at") == newest]
 
 
+#: The one reason that is never worth a word: the market sitting above your ceiling is
+#: the ordinary state of almost every run, on every night, forever.
+ORDINARY = "over-ceiling"
+
+
+def reject_reason(r: dict, cfg) -> str | None:
+    """Why this reading cannot be bought, or None if it can.
+
+    ⭐ ONE source of truth for the trigger's filters. `candidate_under_ceiling` keeps
+    the rows this returns None for and `rejected_under_ceiling` reports the rest, so
+    the two can never disagree about what was refused. A second copy of these
+    conditions would drift, and the copy that drifts is the one deciding whether you
+    are TOLD about a dip you did not buy.
+
+    ⚠️ The checks are ordered so the reason is the most informative one, not the first
+    one that happens to match. Which row is *accepted* does not depend on the order --
+    it is a conjunction -- so this is free.
+    """
+    price = r.get("price_cents")
+    if not isinstance(price, int) or price <= 0:
+        return "no usable price in the reading"
+    if price > cfg.max_price_cents:
+        return ORDINARY
+    if not r.get("available", True):
+        return "the poller recorded it as no longer available"
+    if cfg.min_price_cents and price < cfg.min_price_cents:
+        return (f"below the anomaly floor of "
+                f"{cfg.min_price_cents} centavos (buy.min_price_brl)")
+    need = max(cfg.quantity, cfg.min_available)
+    if (r.get("quantity") or 0) < need:
+        # ⭐ same depth floor as `listing.choose`: triggering on a 1-unit row the
+        # chooser will reject only spends a browser launch on a guaranteed NoMatch,
+        # and every launch is an antifraud event.
+        return (f"only {r.get('quantity') or 0} available and buy.min_available "
+                f"demands {need}")
+    extra = r.get("extra") or {}
+    if cfg.sectors and (extra.get("sector") or "").lower() not in \
+            {s.lower() for s in cfg.sectors}:
+        return f"sector {extra.get('sector')!r} is not in buy.sector {cfg.sectors}"
+    if cfg.entry_classes and (extra.get("entry_class") or "").lower() not in \
+            {c.lower() for c in cfg.entry_classes}:
+        return (f"class {extra.get('entry_class')!r} is not in buy.entry_class "
+                f"{cfg.entry_classes}")
+    return None
+
+
 def candidate_under_ceiling(readings: list[dict], cfg) -> dict | None:
     """The cheapest reading matching the target's buy filters, or None.
 
@@ -182,29 +228,36 @@ def candidate_under_ceiling(readings: list[dict], cfg) -> dict | None:
     TRIGGER -- `cmd_buy` re-resolves live and re-applies the real chooser before it
     spends, so a disagreement between the two costs a no-op, never a wrong purchase.
     """
-    pool = []
-    for r in readings:
-        if not r.get("available", True):
-            continue
-        price = r.get("price_cents")
-        if not isinstance(price, int) or price <= 0 or price > cfg.max_price_cents:
-            continue
-        if cfg.min_price_cents and price < cfg.min_price_cents:
-            continue
-        if (r.get("quantity") or 0) < max(cfg.quantity, cfg.min_available):
-            continue                      # ⭐ same depth floor as `listing.choose`:
-            # triggering on a 1-unit row the chooser will reject only spends a browser
-            # launch on a guaranteed NoMatch, and every launch is an antifraud event.
-        extra = r.get("extra") or {}
-        if cfg.sectors and (extra.get("sector") or "").lower() not in \
-                {s.lower() for s in cfg.sectors}:
-            continue
-        if cfg.entry_classes and (extra.get("entry_class") or "").lower() not in \
-                {c.lower() for c in cfg.entry_classes}:
-            continue
-        pool.append(r)
+    pool = [r for r in readings if reject_reason(r, cfg) is None]
     return min(pool, key=lambda r: (r["price_cents"], -(r.get("quantity") or 0))) \
         if pool else None
+
+
+def rejected_under_ceiling(readings: list[dict], cfg) -> list[tuple[dict, str]]:
+    """Rows at or under the ceiling that a filter still refused, cheapest first.
+
+    ⛔🔴 Exists because `candidate_under_ceiling`'s silence was AMBIGUOUS. It returns
+    None both for "the market is above your ceiling" -- the ordinary outcome of
+    almost every run -- and for "a ticket was under your ceiling and a filter said no".
+    Those two produced byte-identical output: nothing, in any log, in any channel.
+
+    Observed 2026-09-06 and 2026-09-07, on the 11/09 night at a R$200,00 ceiling:
+
+        Gramado || Meia Jovem Baixa Renda  R$198,00  qty 12   7 polls
+        Gramado || Meia PCD                R$198,00  qty 11  10 polls
+
+    price-watcher sent `CRITICAL R$ 198,00 -- under R$ 200,00` for both. `autobuy.log`
+    contains ZERO lines naming either listing: `min_available: 20` rejected them before
+    anything was printed. From the outside the buyer was indistinguishable from a
+    buyer watching a calm market -- and the ceiling was the number everyone was
+    looking at, so nobody suspected a second filter existed.
+    ⭐ `ORDINARY` is excluded on purpose: a signal that also fires on a normal market
+    is a signal that gets muted, and the muted channel is the one the Pix code arrives
+    on.
+    """
+    out = [(r, reason) for r in readings
+           if (reason := reject_reason(r, cfg)) not in (None, ORDINARY)]
+    return sorted(out, key=lambda rr: rr[0].get("price_cents") or 0)
 
 
 def acquire_lock():

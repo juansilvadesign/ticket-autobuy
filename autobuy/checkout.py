@@ -934,6 +934,12 @@ def run_checkout(page, person: Person, *, dry_run: bool = True,
     try:
         if clock is not None:
             clock.mark("ORDER CREATED (final click)")
+        # ⛔🔴 Captured HERE, before anything can navigate. `_pix_from_orders_page`
+        # moves the page to ORDERS_URL, so a `page.url` read at raise time names the
+        # orders page -- and the message below then said "Find it at /ingressos ... ⛔
+        # NOT at /ingressos", pointing the reader away from the one place a live
+        # reservation is visible. Printed verbatim on the 2026-09-10 10:55 run.
+        checkout_url = page.url
         page.wait_for_timeout(4000)
         settle(page, timeout_ms=120_000)
         if clock is not None:
@@ -954,7 +960,7 @@ def run_checkout(page, person: Person, *, dry_run: bool = True,
                 f"AN ORDER MAY EXIST but no Pix code could be read.\n"
                 f"⚠️ Find it at {ORDERS_URL} -> the 'Comprados' tab, open the order and "
                 f"press 'Copiar código'.\n"
-                f"⛔ NOT at {page.url} -- reopening a checkout URL starts a FRESH checkout "
+                f"⛔ NOT at {checkout_url} -- reopening a checkout URL starts a FRESH checkout "
                 f"and shows no order, which reads as 'nothing was reserved' while a real "
                 f"reservation is running down its clock.\n"
                 f"⏰ The hold is ~10 MINUTES from the order, not 30.\n"
