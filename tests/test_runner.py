@@ -382,7 +382,19 @@ def test_a_checkout_that_raises_AFTER_the_click_still_records_and_disarms(
     assert "UNCONFIRMED" in fired["n"]["order_url"]
     raw = json.loads((tmp_path / "targets" / "n.json").read_text(encoding="utf-8"))
     assert raw["buy"]["enabled"] is False, "the night must be disarmed too"
-    assert not sent, "a checkout failure is not a dead session; no alert"
+
+    # ⛔🔴 This assertion USED to read `assert not sent`, and that was the 2026-09-11
+    # bug written down as a requirement. Its intent was sound -- a checkout failure must
+    # not be mis-reported as a DEAD SESSION -- but it was expressed as "no alert at all",
+    # which made the most consequential state change in the whole tool (the night just
+    # disarmed itself and will now refuse every dip) a silent one. It cost 25 hours:
+    # disarmed 09-10 14:24, noticed 09-11 15:39, with 67 in-window polls under the
+    # ceiling in between. The intent is kept, narrowed to what it actually meant.
+    assert len(sent) == 1, "the disarm must be announced exactly once"
+    assert "DISARMED" in sent[0], "it must say the night is now disarmed"
+    assert "ingressos" in sent[0], "it must point at the order, not at the log"
+    assert "BLIND" not in sent[0] and "session is dead" not in sent[0], \
+        "a checkout failure is still not a dead session"
 
 
 # ------------------------------------------------------------------ depth floor

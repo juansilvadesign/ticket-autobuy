@@ -58,6 +58,48 @@ class CheckoutError(AutobuyError):
     """
 
 
+class BudgetExceeded(CheckoutError):
+    """The walk to the order-creating click took longer than the exposure budget.
+
+    ⛔ STRICTLY pre-click, and that is the only place a budget can be enforced at all.
+    After the click a reservation may be live and capturing its code is the only thing
+    that matters -- aborting there to save time would abandon a real unpaid hold, which
+    is worse than any overrun. So this is raised BEFORE the click, never after, and it
+    does not disarm the night: nothing was ordered and the next cron minute retries.
+
+    ⭐🔴 Why a WALK budget and not the old 60 s total: on both 2026-09-10 failures the
+    run was ~30 s at the click and ~83 s at the end, the whole overrun sitting in the
+    47 s post-click Pix read. A 60 s TOTAL budget would therefore have fired at a moment
+    when firing is forbidden, and never during the window it was meant to protect. The
+    number was measuring the wrong span.
+    """
+
+
+class NoOrderCreated(CheckoutError):
+    """The final click was made and provably created NOTHING.
+
+    ⭐🔴 The sibling `OrderMayExistError` lacked, and the gap cost the 11/09 night.
+    That error means "I cannot tell", and it correctly fails CLOSED -- ledger row plus
+    disarm. This one means "I looked, and there is no order", which is a different fact
+    and must NOT disarm: the listing simply evaporated before the click landed, which is
+    the single most likely outcome on a fast market.
+
+    ⛔ It is raised ONLY on two INDEPENDENT signals agreeing, never one:
+      (a) the post-click page BOUNCED -- its URL is neither the checkout nor the orders
+          page, so the click never reached an order-creating endpoint; and
+      (b) the Comprados tab rendered and showed ZERO pending rows.
+    Either alone stays `OrderMayExistError`. A false negative here is the catastrophic
+    direction -- it would leave a real reservation out of the ledger and let the next
+    cron minute buy a SECOND ticket -- so the bar is deliberately two signals, not one.
+
+    Observed 2026-09-10, twice (10:55 and 14:24), both on the 11/09 night:
+    `receipts/rockinrio2026-09-11/order.png` is the event DATE-PICKER page ("3 datas",
+    11/12/13 Set), not a checkout and not an order. Juan verified `/ingressos` ->
+    Comprados by hand after the first: no pending and no bought ticket. Both runs were
+    nonetheless graded `OrderMayExistError`, and the second disarmed the night for good.
+    """
+
+
 class OrderMayExistError(CheckoutError):
     """Raised ONLY after the order-creating click, when the Pix code could not be read.
 

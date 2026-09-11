@@ -17,6 +17,7 @@ Exit codes, matching price-watcher's grammar:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 from pathlib import Path
@@ -28,13 +29,26 @@ HERE = Path(__file__).resolve().parent
 #: listing the row is gone inside that. Anything slower is a tool that reliably produces a
 #: correct answer about a ticket somebody else already bought.
 BUDGET_S = 60.0
+
+#: The span that is actually ENFORCED: resolve -> the order-creating click.
+#: ⛔🔴 `BUDGET_S` above is a REPORT, and it always was -- nothing ever read it but the
+#: printed verdict line. It also measures the wrong span to enforce. Both 2026-09-10
+#: failures stood at ~30 s when they clicked and ~83 s when they finished, the entire
+#: overrun sitting in the 47 s post-click Pix read. Enforcing 60 s TOTAL would have
+#: fired only after the click -- where aborting abandons a live unpaid hold -- and never
+#: once during the window it was meant to protect.
+#: ⭐ 45 s against a measured ~30 s walk: wide enough that a healthy run never trips it,
+#: tight enough to stop the pathological ones the comments already record (a 102 s
+#: screen 1; a 117 s run that "lost the listing outright"). Those are precisely the runs
+#: that click into a listing that has already been sold.
+WALK_BUDGET_S = 45.0
 sys.path.insert(0, str(HERE))
 
 from autobuy import (checkout, config, listing, notify, runner,        # noqa: E402
                      session, timing)
-from autobuy.errors import (AutobuyError, CheckoutError, ConfigError,   # noqa: E402
-                            NoMatch, OrderMayExistError, ResolveError,
-                            SessionError)
+from autobuy.errors import (AutobuyError, BudgetExceeded, CheckoutError,  # noqa: E402
+                            ConfigError, NoMatch, NoOrderCreated,
+                            OrderMayExistError, ResolveError, SessionError)
 
 
 def _fmt_brl(cents: int) -> str:
@@ -134,9 +148,15 @@ def cmd_map(args) -> int:
 
 
 def _execute_buy(cfg, *, fields, headed: bool = False, dry_run: bool = False,
-                 clock=None):
+                 clock=None, deadline_s: float | None = None):
     """The one purchase path. `buy` and `autobuy` MUST share it -- two copies would
-    drift, and the copy that drifts is the one that spends money unattended."""
+    drift, and the copy that drifts is the one that spends money unattended.
+
+    ⚠️ `deadline_s` defaults to None -- no enforcement. Only `autobuy` passes it. A
+    manual `buy` is attended: a human chose the moment, is watching the browser, and can
+    judge for themselves whether a slow run is still worth finishing. The budget exists
+    to stop an UNATTENDED click landing on a listing that sold while nobody was looking.
+    """
     from playwright.sync_api import sync_playwright
     person = checkout.Person.load(fields)
     session.require()                  # fail at startup, not at the payment screen
@@ -155,7 +175,8 @@ def _execute_buy(cfg, *, fields, headed: bool = False, dry_run: bool = False,
         try:
             result = checkout.run_checkout(
                 page, person, dry_run=dry_run, expect_cents=best.price_cents,
-                out_dir=HERE / "receipts" / cfg.target_id, clock=clock)
+                out_dir=HERE / "receipts" / cfg.target_id, clock=clock,
+                deadline_s=deadline_s)
         finally:
             browser.close()
     return best, result
@@ -267,6 +288,241 @@ def _report_rejected(state: dict, cfg, readings: list[dict]) -> None:
               f"{type(e).__name__}: {e})", flush=True)
 
 
+def cmd_orders(args) -> int:
+    """Read `/ingressos` -> Comprados and say what is actually there.
+
+    ⛔🔴 The step `CLAUDE.md` and every `OrderMayExistError` message DEMAND -- *"Verify
+    at /ingressos -> Comprados before re-arming"* -- and which had no command. So it was
+    done by hand, or not at all: the 2026-09-10 **14:24** UNCONFIRMED ledger row was
+    never checked by anyone, and it sat there blocking the 11/09 night for 25 hours.
+    A verification step with no instrument is a verification step that gets skipped.
+
+    ⛔ READ-ONLY, and structurally so: it navigates, clicks the Comprados tab, and reads.
+    It never opens an order's payment control and cannot reach a checkout, so there is
+    no path from here to a reservation.
+    """
+    from playwright.sync_api import sync_playwright                   # noqa: PLC0415
+
+    state_path = session.require()
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=not args.headed)
+        try:
+            context = browser.new_context(storage_state=str(state_path))
+            page = context.new_page()
+            checkout._goto(page, checkout.ORDERS_URL)
+            page.wait_for_timeout(3000)
+            tab = checkout._wait_for(
+                page, lambda pg: checkout._first_visible(pg, "Comprados"),
+                timeout_ms=30_000)
+            if tab is None:
+                # ⛔ Reported as UNKNOWN, never as "nothing there". This is the exact
+                # conflation that made `_pix_from_orders_page` unusable as evidence.
+                print("⚠ could not reach the 'Comprados' tab -- this is NOT evidence "
+                      "that no order exists. Re-run, or look by hand.")
+                return 3
+            tab.click()
+            page.wait_for_timeout(3000)
+            rows = checkout._pending_rows(page)
+            ids = checkout.pending_order_ids(page)
+            shot = Path(args.out) if args.out else None
+            if shot:
+                shot.parent.mkdir(parents=True, exist_ok=True)
+                page.screenshot(path=str(shot), full_page=True)
+            print(f"Comprados rendered at {page.url}")
+            print(f"  pending ('Aguardando pagamento') rows: {len(rows)}")
+            print(f"  order ids visible: {sorted(ids) if ids else '(none)'}")
+            if shot:
+                print(f"  screenshot: {shot}")
+            if not rows:
+                print("\n✅ NOTHING PENDING. No unpaid hold exists on this account.")
+            else:
+                print("\n⚠ A pending hold exists -- open it by hand before re-arming.")
+            return 0
+        finally:
+            browser.close()
+
+
+def cmd_status(args) -> int:
+    """Answer 'is this actually going to buy tonight?' in one command.
+
+    ⛔🔴 The instrument whose absence cost the 11/09 night. Answering that question
+    used to mean reading three files by hand -- the target's `buy.enabled`, the ledger
+    in `state/autobuy.json`, and the tail of `autobuy.log` -- and the one state that
+    mattered (fired + disarmed) was precisely the state that wrote NOTHING to the third.
+    A tool whose armed/disarmed state can only be inferred is a tool that will be found
+    disarmed 25 hours late.
+
+    Read-only by construction: it opens no browser, touches no network, takes no lock
+    and writes no state. Safe to run at any time, including mid-buy.
+    """
+    from datetime import datetime, timezone
+
+    state = runner._read_state()
+    now = datetime.now(timezone.utc)
+    targets = sorted(Path(args.targets).glob("*.json"))
+    if not targets:
+        print(f"no target files in {args.targets}")
+        return 0
+
+    print(f"ticket-autobuy status  ·  {runner.now_local():%Y-%m-%d %H:%M} "
+          f"{runner.now_local().tzname()}  ·  buy window "
+          f"{runner.WINDOW_START:%H:%M}-{runner.WINDOW_END:%H:%M}  ·  "
+          f"{'INSIDE' if runner.within_window(runner.now_local()) else 'OUTSIDE'}")
+    print()
+    any_armed = False
+    for tpath in targets:
+        tid = runner.target_id_of(tpath) or tpath.stem
+        label = _label_of(tpath, tid)
+        entry = runner.fired_entry(state, tid)
+        try:
+            raw = json.loads(tpath.read_text(encoding="utf-8"))
+            blk = raw.get("buy") if isinstance(raw.get("buy"), dict) else {}
+        except (OSError, json.JSONDecodeError):
+            blk = {}
+        enabled = blk.get("enabled") is True
+        ceiling = blk.get("max_price_brl")
+
+        # ⭐ THREE outcomes, never two. "CLOSED" and "PARKED" are both `enabled: false`
+        # and they mean opposite things -- one is a failure nobody saw, the other is a
+        # deliberate choice. The ledger row is the only thing that tells them apart.
+        if entry is not None:
+            kind = ("🔴 CLOSED (UNCONFIRMED order)" if runner.is_unconfirmed(entry)
+                    else "✅ CLOSED (bought)")
+        elif enabled:
+            kind = "🟢 ARMED"; any_armed = True
+        else:
+            kind = "⚪ PARKED (disarmed by hand)"
+
+        print(f"  {label}")
+        print(f"     {kind}"
+              + (f"   ceiling R$ {ceiling:,.2f}".replace(",", ".") if ceiling else ""))
+        if entry is not None:
+            print(f"     ledger: {entry.get('item')} at "
+                  f"{_fmt_brl(entry.get('price_cents') or 0)} on {entry.get('at')}")
+            print(f"     order:  {entry.get('order_url')}")
+
+        hist = Path(args.history) / f"{tid}.jsonl"
+        try:
+            readings = runner.latest_readings(hist, now=now)
+            cheapest = min((r for r in readings
+                            if isinstance(r.get("price_cents"), int)),
+                           key=lambda r: r["price_cents"], default=None)
+            if cheapest:
+                age = (now - datetime.fromisoformat(
+                    cheapest["captured_at"])).total_seconds()
+                mark = ""
+                if ceiling and cheapest["price_cents"] <= int(round(ceiling * 100)):
+                    # ⛔ The line that would have shouted on 11/09: 67 in-window polls
+                    # sat under the ceiling while the night was closed.
+                    mark = ("  ← AT OR UNDER THE CEILING"
+                            + ("" if enabled and entry is None
+                               else " and NOTHING WILL BE BOUGHT"))
+                print(f"     market: {_fmt_brl(cheapest['price_cents'])} "
+                      f"({cheapest.get('item')}, qty {cheapest.get('quantity')}), "
+                      f"polled {age/60:.0f} min ago{mark}")
+        except AutobuyError as e:
+            print(f"     market: ⚠ cannot see this night -- {e}")
+        print()
+
+    if not any_armed:
+        print("⛔ NOTHING IS ARMED. No dip on any night will be bought.")
+    return 0
+
+
+def _label_of(path: Path, target_id: str) -> str:
+    """The target's human label, read WITHOUT the buy block.
+
+    ⚠️ `cfg.label` is unavailable on exactly the targets this matters for -- a disarmed
+    one never survives `config.load`. Falls back to the id, which is always enough to
+    name the night.
+    """
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        lbl = raw.get("label")
+        return lbl if isinstance(lbl, str) and lbl else target_id
+    except (OSError, json.JSONDecodeError):
+        return target_id
+
+
+def _report_inert(state: dict, cfg_label: str, target_id: str,
+                  entry: dict) -> None:
+    """Say that this night is CLOSED, instead of skipping it in silence.
+
+    ⛔🔴 The 25 silent hours this exists to prevent. On 2026-09-10 14:24 BRT an
+    `OrderMayExistError` disarmed the 11/09 night (fail-closed, working as designed).
+    From that minute until 2026-09-11 15:39 the cron fired ~1,500 more times and
+    `state/autobuy.log` gained **0 bytes**, because a fired/disarmed target is skipped
+    by a bare `continue`. The session was alive (keepalive ✅ every 20 min), the poller
+    was healthy, and **67 in-window polls on 11/09 sat at or under the R$250 ceiling** --
+    four straight minutes at R$220,00 with qty 178 among them. A night that is switched
+    OFF looked exactly like a night where nothing dipped.
+    → the same shape as `_report_rejected`, one gate higher up.
+
+    ⭐ Log unconditional, Telegram throttled -- the order `_report_rejected` established.
+    ⛔ Only an UNCONFIRMED row nags. A night that really bought is FINISHED, and a
+    reminder about a job well done is exactly the traffic that teaches a reader to mute
+    the channel the Pix code arrives on.
+    """
+    unconfirmed = runner.is_unconfirmed(entry)
+    print(f"— {cfg_label}: night CLOSED, nothing will be bought -- ledger says "
+          f"{'an order MAY exist (UNCONFIRMED)' if unconfirmed else 'bought'} "
+          f"at {_fmt_brl(entry.get('price_cents') or 0)} on {entry.get('at')}. "
+          f"Clear it from state/autobuy.json and re-arm buy.enabled to buy again.",
+          flush=True)
+    if not unconfirmed:
+        return                       # a finished night is allowed to be quiet
+    if not runner.should_alert(state, f"inert:{target_id}",
+                               every_s=runner.INERT_ALERT_EVERY_S):
+        return
+    runner._write_state(state)
+    try:
+        notify.send_text(
+            os.environ.get("TELEGRAM_BOT_TOKEN", ""),
+            os.environ.get("TELEGRAM_CHAT_ID", ""),
+            f"⚠ ticket-autobuy is DISARMED and buying NOTHING\n\n{cfg_label}\n\n"
+            f"The ledger holds an UNCONFIRMED order from {entry.get('at')} at "
+            f"{_fmt_brl(entry.get('price_cents') or 0)} -- the checkout raised after the "
+            f"order-creating click, so the night was disarmed fail-closed.\n\n"
+            f"Check https://buyticketbrasil.com/ingressos -> 'Comprados'.\n"
+            f"Then EITHER pay it, OR clear the entry from state/autobuy.json and set "
+            f"buy.enabled: true to resume.\n\n"
+            f"Until you do, every dip is being skipped.")
+    except Exception as e:                                            # noqa: BLE001
+        print(f"   (could not deliver the inert-night alert: "
+              f"{type(e).__name__}: {e})", flush=True)
+
+
+def _alert_disarmed(cfg, hit: dict) -> None:
+    """Telegram the DISARM at the moment it happens. Never throttled.
+
+    ⛔ This is the message whose absence cost the 11/09 night. The fail-closed disarm
+    is correct and must stay; what was missing is that it happened on a channel nobody
+    was watching -- a stderr line in a log file, at 14:24, on a day the reader had
+    already checkpointed at 12:00. By construction it can fire at most once per night
+    (the disarm makes it unrepeatable), so it needs no throttle and must not take one:
+    a throttle slot shared with anything else could swallow the only warning there is.
+
+    ⚠️ Delivery failure is swallowed with a printed note. The ledger write and the
+    disarm have ALREADY happened when this runs, and the caller still has to re-raise
+    `OrderMayExistError` -- an undelivered advisory must not rewrite that outcome.
+    """
+    try:
+        notify.send_text(
+            os.environ.get("TELEGRAM_BOT_TOKEN", ""),
+            os.environ.get("TELEGRAM_CHAT_ID", ""),
+            f"🔴 ticket-autobuy DISARMED {cfg.label}\n\n"
+            f"It clicked to order {hit.get('item')} at "
+            f"{_fmt_brl(hit.get('price_cents') or 0)} and then could NOT read the Pix "
+            f"code. An order MAY be live and running down a ~10 minute hold.\n\n"
+            f"→ https://buyticketbrasil.com/ingressos -> 'Comprados'\n\n"
+            f"⛔ This night is now DISARMED: nothing further will be bought on it, "
+            f"however far the price falls, until you clear the entry from "
+            f"state/autobuy.json AND set buy.enabled: true.")
+    except Exception as e:                                            # noqa: BLE001
+        print(f"   (could not deliver the DISARMED alert: "
+              f"{type(e).__name__}: {e})", flush=True)
+
+
 def cmd_autobuy(args) -> int:
     """Cron entry point. At most ONE reservation per invocation, one per night ever."""
     from datetime import datetime, timezone
@@ -293,12 +549,23 @@ def cmd_autobuy(args) -> int:
         state = runner._read_state()
         blind: list[str] = []
         for tpath in sorted(Path(args.targets).glob("*.json")):
+            # ⛔🔴 The ledger is read FIRST, and that order is the fix. `disarm_target`
+            # and `record_fired` fire together, so from the next minute `config.load`
+            # raises ConfigError (disabled) and the `already_fired` check below it was
+            # unreachable -- a disarmed night fell through a bare `continue` into total
+            # silence for 25 hours on 2026-09-10/11. Checking the ledger before the buy
+            # block is validated is the only order in which a CLOSED night can still say
+            # so. ⚠ A target with no ledger row stays silent exactly as before: the six
+            # parked nights are deliberately off and must not become 6 daily messages.
+            tid = runner.target_id_of(tpath)
+            entry = runner.fired_entry(state, tid) if tid else None
+            if entry is not None:
+                _report_inert(state, _label_of(tpath, tid), tid, entry)
+                continue
             try:
                 cfg = config.load(tpath)          # armed targets only
             except ConfigError:
                 continue                          # disarmed or no buy block: not an error
-            if runner.already_fired(state, cfg.target_id):
-                continue
             hist = Path(args.history) / f"{cfg.target_id}.jsonl"
             try:
                 readings = runner.latest_readings(
@@ -331,11 +598,30 @@ def cmd_autobuy(args) -> int:
                   f"{_fmt_brl(cfg.max_price_cents)} -- buying", flush=True)
             clock = timing.Clock(f"autobuy {cfg.target_id}")
             try:
-                best, result = _execute_buy(cfg, fields=args.fields, clock=clock)
+                best, result = _execute_buy(cfg, fields=args.fields, clock=clock,
+                                            deadline_s=WALK_BUDGET_S)
             except NoMatch:
                 # The dip evaporated between price-watcher's read and ours. The single
                 # most likely outcome on a fast market, and an ordinary no-op.
                 print("   gone before we got there; nothing ordered", flush=True)
+                continue
+            except BudgetExceeded as e:
+                # ⭐ Pre-click by construction, so it is graded exactly like NoMatch:
+                # no ledger row, no disarm, the night stays ARMED and the next minute
+                # tries again on a fresher read. ⛔ NOT an OrderMayExistError -- refusing
+                # to click is the opposite of having clicked.
+                print(f"   {e}", flush=True)
+                continue
+            except NoOrderCreated as e:
+                # ⭐🔴 The SAME outcome as NoMatch, discovered one click later. Both
+                # 2026-09-10 runs ended here and were graded `OrderMayExistError`
+                # instead; the second one disarmed the 11/09 night for good, 25 hours
+                # before anyone noticed. ⛔ No bookkeeping is owed: the two-signal test
+                # inside `NoOrderCreated` has already established that no reservation
+                # exists, so a ledger row or a disarm would be recording a purchase that
+                # provably did not happen. The night stays ARMED and the next dip is
+                # still eligible -- which is the entire point.
+                print(f"   {e}", flush=True)
                 continue
             except ResolveError as e:
                 # ⛔🔴 Observed 2026-09-05: this used to escape the loop to `main()`
@@ -376,9 +662,18 @@ def cmd_autobuy(args) -> int:
                               "click. Verify at /ingressos -> Comprados before re-arming.")
                 runner._write_state(state)
                 runner.disarm_target(tpath)
+                # ⛔ AFTER the ledger write and the disarm, never before: an alert that
+                # beat the bookkeeping could be the only trace of a reservation the
+                # ledger then failed to record.
+                _alert_disarmed(cfg, hit)
                 raise
             finally:
-                print("\n" + clock.report(budget_s=BUDGET_S), flush=True)
+                # ⭐ The autobuy path is the one that ENFORCES the walk, so it is the one
+                # that must print it. The manual `buy` path above keeps the total-only
+                # report -- labelling a budget "ENFORCED" where nothing enforces it is
+                # exactly the kind of decorative declaration that hid the last bug.
+                print("\n" + clock.report(budget_s=BUDGET_S,
+                                          walk_budget_s=WALK_BUDGET_S), flush=True)
 
             # ⛔ Record BEFORE notifying. A delivery failure must never leave a real
             # reservation absent from the ledger -- that is how the next cron minute
@@ -449,6 +744,19 @@ def main(argv=None) -> int:
                          "would nearly double the request budget.")
     ab.add_argument("--fields", default=str(HERE / "fields.json"),
                     help="buyer personal data (gitignored)")
+    od = sub.add_parser("orders",
+                       help="read /ingressos -> Comprados; never buys")
+    od.set_defaults(fn=cmd_orders)
+    od.add_argument("--headed", action="store_true", help="show the browser")
+    od.add_argument("--out", default=str(HERE / "receipts" / "orders-check.png"),
+                    help="screenshot path -- the evidence a ledger decision rests on")
+
+    st = sub.add_parser("status",
+                       help="is anything actually armed? reads only -- never buys")
+    st.set_defaults(fn=cmd_status)
+    st.add_argument("--targets", default=str(PW / "targets"))
+    st.add_argument("--history", default=str(PW / "history"))
+
     ab.add_argument("--verbose", "-v", action="store_true",
                     help="say why nothing happened -- without it a skipped run is silent, "
                          "which is correct for cron and useless when you are debugging")
@@ -469,6 +777,12 @@ def main(argv=None) -> int:
         print(f"blind: {e}", file=sys.stderr);    return 2
     except NoMatch as e:
         print(f"no match: {e}");                  return 0
+    except NoOrderCreated as e:
+        # ⛔ BEFORE the CheckoutError arm below, which would grade it exit 3. Nothing was
+        # reserved, so this is an ordinary no-op, not a failure needing a human.
+        print(f"nothing ordered: {e}");           return 0
+    except BudgetExceeded as e:
+        print(f"too slow, nothing ordered: {e}"); return 0
     except (SessionError, CheckoutError) as e:
         print(f"stopped: {e}", file=sys.stderr);  return 3
     except notify.NotifyError as e:

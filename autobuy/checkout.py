@@ -35,7 +35,8 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .errors import AutobuyError, CheckoutError, OrderMayExistError, SessionError
+from .errors import (AutobuyError, BudgetExceeded, CheckoutError, NoOrderCreated,
+                     OrderMayExistError, SessionError)
 from . import session as session_mod
 
 # ⚠️ buyticketbrasil takes ~12s to reach domcontentloaded from this machine, measured
@@ -141,7 +142,102 @@ def _actionable(el: dict) -> bool:
                 or (el.get("placeholder") or "").strip())
 
 
-def settle(page, *, timeout_ms: int = 90_000, poll_ms: int = 500) -> list[dict]:
+def _screen_signature(elements: list[dict]) -> tuple:
+    """A stable fingerprint of the ACTIONABLE controls on screen.
+
+    ⛔ Deliberately excludes `cls` even though `_PROBE_JS` already normalises the
+    build hash: two renders of one screen can differ in class soup while offering the
+    identical controls, and a signature that flickers would read as a transition that
+    never happened. Text/aria/placeholder is what distinguishes one checkout screen
+    from the next, which is exactly what the flow is driven by.
+    """
+    return tuple(sorted(
+        (e.get("tag") or "", (e.get("text") or "").strip(),
+         (e.get("aria") or "").strip(), (e.get("placeholder") or "").strip())
+        for e in elements if _actionable(e)))
+
+
+def _quiesce(page, seen: list[dict], *, budget_ms: int = 1500, poll_ms: int = 200,
+             stable_polls: int = 3) -> list[dict]:
+    """Wait until the control set STOPS changing, and return the richest view seen.
+
+    ⭐ Replaces a flat `wait_for_timeout(1500)` whose comment was "let the rest of the
+    tree land" -- a guess that paid 1.5 s on every screen whether the tree had landed
+    in 200 ms or was still moving at 1.6 s. Bounded by the SAME 1500 ms, so the worst
+    case is exactly the old behaviour and the typical case is ~600 ms.
+
+    ⛔ Richest-view-wins is preserved verbatim from the code this replaces: a Bubble
+    re-render mid-settle must never turn a populated step into an empty one. Quiescence
+    decides WHEN to stop looking, never WHAT to hand back.
+    ⚠️ `stable_polls` is 3, not 2: this app paints in bursts, and two consecutive equal
+    reads happen in the gap between two bursts.
+    """
+    # ⛔ Bounded by BOTH wall-clock and iteration count. Pacing comes from
+    # `page.wait_for_timeout`, which sleeps on a real page and is a NO-OP on a double --
+    # so a clock-only bound busy-spins the full budget against any page that does not
+    # sleep. That is not merely slow: it is a loop whose termination depends on a
+    # collaborator's side effect, which is exactly the kind of hidden coupling that
+    # makes a timeout mean different things in two environments.
+    deadline = time.monotonic() + budget_ms / 1000
+    max_polls = max(1, int(budget_ms // max(poll_ms, 1)))
+    best = seen
+    sig = _screen_signature(seen)
+    stable = 0
+    for _ in range(max_polls):
+        if time.monotonic() >= deadline:
+            break
+        page.wait_for_timeout(poll_ms)
+        try:
+            els = page.evaluate(_PROBE_JS)
+        except Exception:                                  # noqa: BLE001
+            continue                                       # mid-navigation; keep waiting
+        if len(els) >= len(best):
+            best = els
+        now_sig = _screen_signature(els)
+        stable = stable + 1 if now_sig == sig else 0
+        sig = now_sig
+        if stable >= stable_polls:
+            break
+    return best
+
+
+def _await_transition(page, before: tuple, *, budget_ms: int,
+                      poll_ms: int = 150) -> bool:
+    """Wait until the screen is no longer the one we just acted on.
+
+    ⭐ Replaces `wait_for_timeout(2000)` after a 'Continuar' click. On a fast render the
+    fixed sleep burned ~1.7 s of an exposure window in which the listing can be sold;
+    this returns as soon as the app has actually swapped the screen.
+
+    ⚠️ It is a SPEED fix, not a correctness one, and the distinction matters. If the app
+    takes LONGER than the budget to swap, this returns False and the caller proceeds
+    exactly as the fixed sleep did -- `settle` then re-reads the still-mounted old
+    screen, whose controls are still actionable, and the loop can click the same
+    'Continuar' twice. That hazard is UNCHANGED. Closing it means blocking until the
+    signature moves, which cannot be done safely here: this checkout uses progressive
+    disclosure on one URL, so "no change yet" and "this step legitimately looks the
+    same" are not distinguishable from the control set alone.
+
+    Returns True if the screen changed within the budget. A False is not graded as a
+    failure: this narrows a window, it does not adjudicate the flow.
+    """
+    # ⛔ Same dual bound as `_quiesce`, for the same reason.
+    deadline = time.monotonic() + budget_ms / 1000
+    max_polls = max(1, int(budget_ms // max(poll_ms, 1)))
+    for _ in range(max_polls):
+        if time.monotonic() >= deadline:
+            break
+        page.wait_for_timeout(poll_ms)
+        try:
+            if _screen_signature(page.evaluate(_PROBE_JS)) != before:
+                return True
+        except Exception:                                  # noqa: BLE001
+            continue                                       # mid-navigation IS a change
+    return False
+
+
+def settle(page, *, timeout_ms: int = 90_000, poll_ms: int = 500,
+           settle_ms: int = 1500) -> list[dict]:
     """Wait until the app has rendered, and return THE CONTROLS IT SAW.
 
     ⛔ Not a fixed sleep. The first version waited 1200 ms and dumped 0 controls from a
@@ -171,14 +267,9 @@ def settle(page, *, timeout_ms: int = 90_000, poll_ms: int = 500) -> list[dict]:
         except Exception:                                  # noqa: BLE001
             els = []                                       # mid-navigation; keep waiting
         if any(_actionable(e) for e in els):
-            page.wait_for_timeout(1500)                    # let the rest of the tree land
-            try:
-                # Re-read after settling, and keep whichever view is richer. A Bubble
-                # re-render mid-settle must never turn a populated step into an empty one.
-                later = page.evaluate(_PROBE_JS)
-                return later if len(later) >= len(els) else els
-            except Exception:                              # noqa: BLE001
-                return els
+            # ⭐ Was a flat `wait_for_timeout(1500)` + one re-read. Same 1500 ms ceiling,
+            # but it stops as soon as the tree has actually stopped moving.
+            return _quiesce(page, els, budget_ms=settle_ms)
         last = els                                         # spinners only: keep waiting
         page.wait_for_timeout(poll_ms)
     # Timed out. Return whatever was last seen so the dump records the stuck state
@@ -529,6 +620,40 @@ PIX_COPY_BUTTON = "#btn_copy"
 #: a real reservation exists. That mistake was made, live, on the night this was written.
 ORDERS_URL = "https://buyticketbrasil.com/ingressos"
 
+#: Paths on which the checkout flow can legitimately come to rest after the final
+#: click. ⛔ An ALLOW-list, never a deny-list: an unknown page must read as "bounced"
+#: only in combination with the orders probe, and a deny-list of pages-we-have-seen
+#: would silently classify the next unseen one as still-in-flow.
+IN_FLOW_PATHS = ("/checkout", "/ingressos")
+
+
+def _click_bounced(url: str) -> bool:
+    """True when the post-click page is NOT somewhere an order can live.
+
+    ⭐🔴 Measured 2026-09-10 on both failed runs: `order.png` is the event
+    DATE-PICKER ("Rock In Rio 2026 · 3 datas", 11/12/13 Set 2026). The app bounced there
+    because the listing was gone before the click landed, so the click never reached an
+    order-creating endpoint. The checkout itself keeps its `/checkout?...&p=2` URL and
+    shows "Aguarde…", and the order lives under `/ingressos` -- everything else means
+    the flow fell out.
+
+    ⚠️ On its own this is a HINT, never a verdict. It is one half of the two-signal test
+    in `NoOrderCreated`; the other half is the Comprados tab rendering with zero pending
+    rows. A bounce alone still fails CLOSED.
+    """
+    if not url:
+        # ⛔ An absent URL is not evidence of a bounce -- it is evidence of nothing.
+        # Returning True here would let "I could not read the page" masquerade as
+        # "I read it and the flow fell out", which is the exact conflation this whole
+        # change exists to remove, reintroduced one layer down.
+        return False
+    try:
+        from urllib.parse import urlparse
+        path = urlparse(url).path or "/"
+    except Exception:                                      # noqa: BLE001
+        return False                                       # unreadable: stay fail-closed
+    return not any(path.startswith(p) for p in IN_FLOW_PATHS)
+
 
 def _looks_like_pix(val: str) -> bool:
     """A Pix EMV payload opens with the payload-format tag `0002`. Length is checked too
@@ -653,7 +778,8 @@ def _open_order(page, status_el) -> bool:
 def _pix_from_orders_page(page, *, timeout_ms: int = 45_000,
                           max_orders: int = 3,
                           button_timeout_ms: int = 12_000,
-                          exclude_ids: set[str] | None = None) -> dict:
+                          exclude_ids: set[str] | None = None,
+                          probe: dict | None = None) -> dict:
     """Navigate to the ORDER and read its code.
 
     ⭐ THE correction from three real runs. Clicking the final "Comprar agora" does NOT
@@ -674,7 +800,20 @@ def _pix_from_orders_page(page, *, timeout_ms: int = 45_000,
     read, because "the one that had a code" is a heuristic, not an identity.
 
     ⛔ Read-only: it navigates and clicks account UI. It cannot create an order.
+
+    ⭐🔴 `probe` is how this function stops LYING BY OMISSION. An empty `{}` return
+    had FOUR structurally different causes -- the Comprados tab never appeared; the tab
+    rendered with zero pending rows; the pending rows were exhausted; a driver threw --
+    and the caller collapsed all four into "AN ORDER MAY EXIST". The second of those is
+    the opposite fact: this very function comments it, `# nothing pending at all -- no
+    order`, and then had no way to say so. "I looked and found nothing" and "I could not
+    look" left through the same door, so 45 s of successful evidence-gathering was
+    graded as ignorance -- twice on 2026-09-10, and the second one disarmed the night.
+    Pass a dict to receive `comprados_rendered: bool` and `pending_rows: int`.
     """
+    if probe is not None:
+        probe.setdefault("comprados_rendered", False)
+        probe.setdefault("pending_rows", None)
     for idx in range(max_orders):
         try:
             _goto(page, ORDERS_URL)
@@ -683,9 +822,18 @@ def _pix_from_orders_page(page, *, timeout_ms: int = 45_000,
             if tab is None:
                 return {}
             tab.click()
+            if probe is not None:
+                probe["comprados_rendered"] = True
             rows = _wait_for(page, _pending_rows, timeout_ms=timeout_ms)
             if not rows:
+                # ⭐ POSITIVE evidence, not a dead end: the orders page rendered and
+                # holds nothing pending. Recorded so the caller can tell this apart
+                # from never having reached the page at all.
+                if probe is not None:
+                    probe["pending_rows"] = 0
                 return {}                      # nothing pending at all -- no order
+            if probe is not None:
+                probe["pending_rows"] = len(rows)
             if idx >= len(rows):
                 return {}                      # exhausted the pending orders
             if not _open_order(page, rows[idx]):
@@ -775,7 +923,8 @@ def _greyout_state(page) -> list[bool]:
 
 def run_checkout(page, person: Person, *, dry_run: bool = True,
                  expect_cents: int | None = None,
-                 out_dir: Path | None = None, clock=None) -> dict:
+                 out_dir: Path | None = None, clock=None,
+                 deadline_s: float | None = None) -> dict:
     """Drive the checkout to a Pix payload. ⛔ Reserves; never pays.
 
     Written from the map of 2026-09-02, which walked all five screens live:
@@ -796,6 +945,18 @@ def run_checkout(page, person: Person, *, dry_run: bool = True,
     if out_dir:
         out_dir.mkdir(parents=True, exist_ok=True)
 
+    # ⛔ Measured from the CLOCK when there is one, because the clock starts before the
+    # market is resolved -- and the exposure window is "from the price we believed to
+    # the click", not "from the moment the browser opened". Falling back to a local
+    # start would silently shorten the very span being budgeted.
+    _t0 = time.monotonic()
+
+    def _elapsed() -> float:
+        return clock.elapsed if clock is not None else time.monotonic() - _t0
+
+    def _over_budget() -> bool:
+        return deadline_s is not None and _elapsed() > deadline_s
+
     # ⛔ NO pre-flight snapshot of existing orders here, deliberately. It was tried
     # 2026-09-04 and removed the same hour: the extra /ingressos round trip TIMED OUT
     # and retried, taking screen 1 from ~4 s to 102 s and the run from 71 s to 128 s.
@@ -809,6 +970,14 @@ def run_checkout(page, person: Person, *, dry_run: bool = True,
     # site REFUSED the new order because a hold still existed, and the reader then
     # returned the stale order's payload as if it were the new one.
     for step in range(1, 9):
+        if _over_budget():
+            # ⭐ Checked BEFORE settle, not after: settle can wait 90 s, and starting one
+            # while already over budget spends the window this guard exists to protect.
+            raise BudgetExceeded(
+                f"step {step}: {_elapsed():.1f}s spent walking the checkout, over the "
+                f"{deadline_s:.0f}s exposure budget. Nothing was ordered -- the listing "
+                f"this slow to reach is the one most likely to be gone. "
+                f"The next run retries.")
         elements = settle(page)
         if clock is not None:
             clock.mark(f"screen {step} rendered")
@@ -846,7 +1015,10 @@ def run_checkout(page, person: Person, *, dry_run: bool = True,
                     f"step {step}: the 'Continuar' click never landed at {page.url} -- "
                     f"{type(e).__name__}: {e}\n"
                     f"Nothing was ordered. The next run retries.") from e
-            page.wait_for_timeout(2000)
+            # ⭐ Was a flat 2000 ms. Same ceiling, but it returns the moment the app
+            # has actually swapped the screen -- and if it has NOT swapped, waiting the
+            # full budget is what the fixed sleep only pretended to do.
+            _await_transition(page, _screen_signature(elements), budget_ms=2000)
             continue
 
         final = _first_visible(page, "Comprar agora") or _first_visible(page, "Comprar")
@@ -870,7 +1042,7 @@ def run_checkout(page, person: Person, *, dry_run: bool = True,
                     f"step 1: the 'Comprar agora' that OPENS the checkout never landed "
                     f"at {page.url} -- {type(e).__name__}: {e}\n"
                     f"Nothing was ordered. The next run retries.") from e
-            page.wait_for_timeout(2500)
+            _await_transition(page, _screen_signature(elements), budget_ms=2500)
             continue
 
         # ── the point of no return ────────────────────────────────────────────────
@@ -897,6 +1069,20 @@ def run_checkout(page, person: Person, *, dry_run: bool = True,
         if dry_run:
             return {"dry_run": True, "price_cents": shown, "url": page.url,
                     "note": "stopped one click short of 'Comprar agora'"}
+
+        # ⛔🔴 THE enforcement point, and the last instant one is permissible. One line
+        # below, a click may create a reservation, and from then on time pressure is
+        # irrelevant to correctness -- the code MUST be captured however long it takes.
+        # ⚠️ Deliberately AFTER the price check: a drift is the more specific diagnosis
+        # and should keep its own message when both are true.
+        if _over_budget():
+            raise BudgetExceeded(
+                f"{_elapsed():.1f}s from resolve to the point of no return, over the "
+                f"{deadline_s:.0f}s exposure budget -- REFUSING to click.\n"
+                f"The price still verified at {shown} centavos, but the listing has had "
+                f"{_elapsed():.0f}s to be sold, and a click into a listing that is gone "
+                f"bounces to the event page and reads as 'an order may exist'.\n"
+                f"Nothing was ordered. The next run retries.")
 
         try:
             final.click()
@@ -947,12 +1133,33 @@ def run_checkout(page, person: Person, *, dry_run: bool = True,
         if out_dir:
             page.screenshot(path=str(out_dir / "order.png"), full_page=True)
 
+        # ⛔🔴 Read AFTER `settle`, not at click time. `checkout_url` above is captured
+        # immediately so the error message can name it, but the bounce IS the app
+        # navigating away -- it has not happened yet one line after the click. The
+        # screenshot taken just above is of this page, which is what made the bounce
+        # visible in the first place.
+        settled_url = page.url
         pix = _extract_pix(page)
+        probe: dict = {}
         if not pix:
             # The checkout page never becomes the Pix screen -- go to the order itself.
-            pix = _pix_from_orders_page(page)
+            pix = _pix_from_orders_page(page, probe=probe)
         if clock is not None:
             clock.mark("PIX CODE EXTRACTED")
+        if not pix and _click_bounced(settled_url) and \
+                probe.get("comprados_rendered") and probe.get("pending_rows") == 0:
+            # ⭐ TWO independent signals agreeing: the click fell out of the flow, AND
+            # the orders page rendered holding nothing. Graded as strictly pre-click --
+            # no ledger row, no disarm, the night stays armed -- because that is what
+            # the evidence says. Anything less than both still falls through to the
+            # fail-closed branch below.
+            raise NoOrderCreated(
+                f"the listing was gone before the click landed -- NO order exists.\n"
+                f"The page bounced to {settled_url} (not a checkout, not an order), and "
+                f"{ORDERS_URL} -> 'Comprados' rendered with zero pending rows.\n"
+                f"⭐ The night stays ARMED: nothing was reserved, so there is nothing to "
+                f"verify and nothing to pay.\n"
+                f"A screenshot is in {out_dir or '(no out_dir given)'}.")
         if not pix:
             # ⛔ Never retried and never swallowed. A retry would risk a SECOND reservation,
             # and a swallow would leave a real, paid-for-able order with no code to pay it.

@@ -278,8 +278,48 @@ def acquire_lock():
     return fh
 
 
+def target_id_of(path: Path) -> str | None:
+    """The target's `id`, read WITHOUT validating the buy block.
+
+    ⛔🔴 Why this exists, and it is the whole 2026-09-11 bug: `disarm_target` and
+    `record_fired` fire TOGETHER, so from the next cron minute onward `config.load`
+    raises `ConfigError` (disabled) and `already_fired` is never reached. The ledger
+    guard was structurally UNREACHABLE in production -- a declaration nothing asserted.
+    Reading the id straight off the JSON is what lets the ledger be consulted before
+    the buy block is validated, which is the only order in which a DISARMED night can
+    still announce itself.
+    """
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    tid = raw.get("id")
+    return tid if isinstance(tid, str) and tid else None
+
+
 def already_fired(state: dict, target_id: str) -> bool:
     return target_id in (state.get("fired") or {})
+
+
+def fired_entry(state: dict, target_id: str) -> dict | None:
+    """The ledger row for `target_id`, or None. Carries `order_url`, which is how an
+    UNCONFIRMED reservation is told apart from a clean, finished buy."""
+    e = (state.get("fired") or {}).get(target_id)
+    return e if isinstance(e, dict) else None
+
+
+def is_unconfirmed(entry: dict | None) -> bool:
+    """True when the ledger row was written by the fail-CLOSED path.
+
+    `order_url` is the discriminator: the happy path stores a real URL, and the
+    `OrderMayExistError` path stores the sentence beginning `UNCONFIRMED`. An
+    unconfirmed row means a reservation MAY be live and a human still has to look --
+    it is the one ledger state that must keep nagging.
+    """
+    if not entry:
+        return False
+    url = entry.get("order_url")
+    return not isinstance(url, str) or not url.startswith("http")
 
 
 def record_fired(state: dict, target_id: str, *, price_cents: int,
@@ -312,6 +352,13 @@ def disarm_target(path: Path) -> None:
 #: 1-minute cron sends 1,440 identical Telegram messages a day, which trains the reader
 #: to mute the channel -- and the muted channel is the one the Pix code arrives on.
 ALERT_EVERY_S = 30 * 60
+
+#: ⚠️ A STEADY state, not an event: a disarmed night stays disarmed, so 30 min would
+#: send 48 messages a day about a condition that has not changed -- which is the same
+#: mute-the-channel failure `ALERT_EVERY_S` exists to prevent, arriving from the other
+#: direction. 6 h is four reminders a day: often enough that 25 silent hours cannot
+#: happen again, rare enough to stay readable.
+INERT_ALERT_EVERY_S = 6 * 3600
 
 
 def should_alert(state: dict, key: str, *, every_s: int = ALERT_EVERY_S,

@@ -211,7 +211,11 @@ def test_the_deliberate_NO_PIX_error_is_not_re_wrapped(monkeypatch):
     """
     page, final = _reaches_the_order(monkeypatch)
     monkeypatch.setattr(checkout, "_extract_pix", lambda pg: {})
-    monkeypatch.setattr(checkout, "_pix_from_orders_page", lambda pg: {})
+    # ⚠️ `**kw` because the real function now takes `probe=`. A stub whose signature
+    # has drifted from its subject raises TypeError INSIDE the tail's try, which the
+    # blanket wrapper then re-grades -- so the test would fail for a reason that has
+    # nothing to do with what it is asserting.
+    monkeypatch.setattr(checkout, "_pix_from_orders_page", lambda pg, **kw: {})
 
     with pytest.raises(OrderMayExistError) as ei:
         checkout.run_checkout(page, None, dry_run=False, expect_cents=13200)
