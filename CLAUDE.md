@@ -55,6 +55,29 @@ handed a code and pay it.
   A notifier that fails quietly here does not degrade the feature, it deletes it while
   logging success. The QR *image* is the one exception: it rides on top of a code that
   already landed, so its failure must not turn a complete success into exit 3.
+- **The only ENFORCEABLE budget is the walk: resolve → the order-creating click**
+  (`WALK_BUDGET_S`, 45 s, checked before each screen and once immediately before the click).
+  ⛔ Never enforce a budget after that click — a reservation may be live and its code must be
+  captured however long it takes. `BUDGET_S` (60 s) is a REPORT and always was; it measures a
+  span whose overrun sits entirely past the point of no return, so it could only ever fire
+  where firing is forbidden. Print both, and label which one binds.
+- **A refusal to click is a no-op, not a failed purchase.** `BudgetExceeded` and
+  `NoOrderCreated` are strictly pre-click: no ledger row, no disarm, the night stays ARMED,
+  exit 0. Only `OrderMayExistError` — genuine ambiguity after the click — fails closed.
+  ⛔ `NoOrderCreated` needs TWO independent signals (the page bounced out of the flow AND
+  Comprados rendered with zero pending rows); either alone still fails closed, because a false
+  negative leaves a real reservation unrecorded and the next cron minute buys a second ticket.
+- **A night that is switched OFF must say so.** A fired/disarmed target used to be skipped by a
+  bare `continue`, which is byte-identical to a calm market: on 2026-09-10/11 that hid a disarm
+  for 25 h while 67 in-window polls sat under the ceiling. ⛔ Distinguish *closed by a failure*
+  (ledger row → announce, and nag while `UNCONFIRMED`) from *parked by hand* (no ledger row →
+  stay silent), and never nag about a night that really bought.
+- **Ship the verification step as a command.** `buy.py status` (is anything armed?) and
+  `buy.py orders` (what does Comprados actually hold?) are read-only and take no lock.
+  ⛔ A verification this file *demands* but provides no instrument for is one that gets skipped —
+  which is exactly how an `UNCONFIRMED` ledger row went unchecked for a day.
+  ⚠️ `orders` reports an unreachable tab as **exit 3**, never as "nothing pending": "I could not
+  look" must never print like "I looked and it was clean".
 - **Never select on a CSS-module class name.** They carry a build hash (`CLLKWG`) that
   changes on any redeploy. Roles, `aria-label`s and text; substring match if forced.
 - ⛔ **Never retry a failed checkout automatically.** A half-finished flow may or may not
