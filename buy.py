@@ -190,10 +190,24 @@ def cmd_buy(args) -> int:
     try:
         cfg = config.load(args.target)
         best, result = _execute_buy(cfg, fields=args.fields, headed=args.headed,
-                                    dry_run=args.dry_run, clock=clock)
+                                    dry_run=args.dry_run, clock=clock,
+                                    deadline_s=args.deadline)
         if result.get("dry_run"):
             print(f"\n\u2705 dry run: stopped one click short of 'Comprar agora'. "
                   f"Nothing was ordered.\n   {result}")
+            # ⭐ A rehearsal has to say whether it PASSED the gate, not just how long it
+            # took. `Clock.walk_elapsed` cannot answer here -- it keys on the
+            # "ORDER CREATED" mark, which a dry run never reaches -- so the walk is read
+            # off the result, where `run_checkout` measured it against the same clock
+            # the real gate uses. ⛔ Only printed when a deadline was actually given:
+            # a verdict against a budget nobody set is the decorative kind.
+            walk = result.get("walk_s")
+            if args.deadline is not None and walk is not None:
+                slack = args.deadline - walk
+                verdict = "\u2705 would have CLICKED" if slack >= 0 else \
+                          "\u26d4 would have REFUSED"
+                print(f"   walk   {args.deadline:g}s (rehearsed, resolve->click) "
+                      f"= {walk:.2f}s -> {verdict} by {abs(slack):.2f}s")
             return 0
         notify.send_pix(
             os.environ.get("TELEGRAM_BOT_TOKEN", ""),
@@ -767,6 +781,12 @@ def main(argv=None) -> int:
     buy_p.add_argument("--headed", action="store_true", help="show the browser")
     buy_p.add_argument("--dry-run", action="store_true", default=False,
                        help="stop before the order-creating click")
+    buy_p.add_argument("--deadline", type=float, default=None,
+                       help="seconds from the first line of work to the order-creating "
+                            "click, after which this REFUSES to click. Default: no "
+                            "enforcement -- a manual buy is attended. Pair it with "
+                            "--dry-run to rehearse the gate `autobuy` applies at "
+                            "WALK_BUDGET_S without arming anything.")
 
     args = ap.parse_args(argv)
     try:

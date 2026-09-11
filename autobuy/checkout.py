@@ -975,7 +975,7 @@ def run_checkout(page, person: Person, *, dry_run: bool = True,
             # while already over budget spends the window this guard exists to protect.
             raise BudgetExceeded(
                 f"step {step}: {_elapsed():.1f}s spent walking the checkout, over the "
-                f"{deadline_s:.0f}s exposure budget. Nothing was ordered -- the listing "
+                f"{deadline_s:g}s exposure budget. Nothing was ordered -- the listing "
                 f"this slow to reach is the one most likely to be gone. "
                 f"The next run retries.")
         elements = settle(page)
@@ -1023,8 +1023,24 @@ def run_checkout(page, person: Person, *, dry_run: bool = True,
 
         final = _first_visible(page, "Comprar agora") or _first_visible(page, "Comprar")
         if final is None:
+            # ⛔🔴 This message used to say "the flow changed; re-run `map`" in BOTH
+            # cases, and it was recorded as MISLEADING long before it was fixed: the
+            # flow is usually fine, the LISTING evaporated mid-walk and the app bounced
+            # out of the checkout. Reproduced live 2026-09-11 on the 13/09 event -- one
+            # stale row (c_anuncio ...9163639918x...) bounced to /datas/ at screen 2 on
+            # three separate runs while a sibling row walked all five screens. Sending a
+            # reader to re-map a checkout that never changed costs an hour and finds
+            # nothing. `_click_bounced` already knows the difference.
+            if _click_bounced(page.url):
+                raise CheckoutError(
+                    f"step {step}: the listing evaporated mid-walk -- the app bounced "
+                    f"to {page.url}, which is outside the checkout flow.\n"
+                    f"⭐ The flow is FINE; do NOT re-run `map`. The row was sold or "
+                    f"withdrawn between the resolve and this screen.\n"
+                    f"Nothing was ordered. The next run retries on a fresher read.")
             raise CheckoutError(f"step {step}: no 'Continuar' and no 'Comprar agora' at "
-                                f"{page.url} -- the flow changed; re-run `map`.")
+                                f"{page.url} -- still inside the checkout, so this one "
+                                f"really may be a flow change; re-run `map`.")
 
         # ⛔ Screen 1's only control is ALSO labelled "Comprar agora", and it merely
         # OPENS the checkout -- verified 2026-09-02. Text cannot separate it from the
@@ -1066,23 +1082,29 @@ def run_checkout(page, person: Person, *, dry_run: bool = True,
                     f"ordered.")
         if out_dir:
             page.screenshot(path=str(out_dir / "pre-order.png"), full_page=True)
-        if dry_run:
-            return {"dry_run": True, "price_cents": shown, "url": page.url,
-                    "note": "stopped one click short of 'Comprar agora'"}
-
         # ⛔🔴 THE enforcement point, and the last instant one is permissible. One line
-        # below, a click may create a reservation, and from then on time pressure is
-        # irrelevant to correctness -- the code MUST be captured however long it takes.
+        # below the dry-run gate, a click may create a reservation, and from then on time
+        # pressure is irrelevant to correctness -- the code MUST be captured however long
+        # it takes.
         # ⚠️ Deliberately AFTER the price check: a drift is the more specific diagnosis
         # and should keep its own message when both are true.
+        # ⭐ And deliberately BEFORE the dry-run return, so `--dry-run --deadline` is a
+        # FAITHFUL rehearsal of this gate rather than a path that skips it. Otherwise the
+        # only way to exercise the guard that refuses to spend money is to arm something
+        # that can spend money -- which is not a test anyone runs twice.
         if _over_budget():
             raise BudgetExceeded(
                 f"{_elapsed():.1f}s from resolve to the point of no return, over the "
-                f"{deadline_s:.0f}s exposure budget -- REFUSING to click.\n"
+                f"{deadline_s:g}s exposure budget -- REFUSING to click.\n"
                 f"The price still verified at {shown} centavos, but the listing has had "
                 f"{_elapsed():.0f}s to be sold, and a click into a listing that is gone "
                 f"bounces to the event page and reads as 'an order may exist'.\n"
                 f"Nothing was ordered. The next run retries.")
+
+        if dry_run:
+            return {"dry_run": True, "price_cents": shown, "url": page.url,
+                    "walk_s": round(_elapsed(), 2),
+                    "note": "stopped one click short of 'Comprar agora'"}
 
         try:
             final.click()

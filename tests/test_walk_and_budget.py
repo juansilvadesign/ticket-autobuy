@@ -320,3 +320,144 @@ def test_a_refused_click_leaves_the_night_ARMED(tmp_path, monkeypatch):
     raw = json.loads((targets / "n.json").read_text(encoding="utf-8"))
     assert raw["buy"]["enabled"] is True, "refusing to click must not disarm"
     assert not runner._read_state().get("fired"), "and must not write a ledger row"
+
+
+# ── the gate must be exercisable WITHOUT arming a live buy ───────────────────
+
+def test_a_dry_run_REHEARSES_the_gate(monkeypatch):
+    """⛔🔴 The testability defect this closes: `BudgetExceeded` used to be reachable
+    only from `cmd_autobuy`, which means the only way to exercise the guard that refuses
+    to spend money was to arm something that can spend money. A guard nobody can
+    rehearse is a guard nobody has seen work.
+    """
+    page, final = _reaches_the_order(monkeypatch)
+    with pytest.raises(BudgetExceeded):
+        checkout.run_checkout(page, None, dry_run=True, expect_cents=13200,
+                              clock=_Clock(90.0), deadline_s=45.0)
+    assert final.clicks == 0
+
+
+def test_a_dry_run_inside_the_budget_reports_the_walk(monkeypatch):
+    """⭐ The number that could not be produced from a synthetic page: what the walk
+    actually cost. A dry run is the only way to measure it without buying."""
+    page, final = _reaches_the_order(monkeypatch)
+    out = checkout.run_checkout(page, None, dry_run=True, expect_cents=13200,
+                                clock=_Clock(18.5), deadline_s=45.0)
+    assert out["dry_run"] is True
+    assert out["walk_s"] == 18.5, "the dry run must report what it measured"
+    assert final.clicks == 0, "⛔ and must still never click"
+
+
+def test_a_dry_run_with_no_deadline_is_unchanged(monkeypatch):
+    """⚠️ The default path must not acquire a new way to fail."""
+    page, final = _reaches_the_order(monkeypatch)
+    out = checkout.run_checkout(page, None, dry_run=True, expect_cents=13200,
+                                clock=_Clock(999.0), deadline_s=None)
+    assert out["dry_run"] is True and final.clicks == 0
+
+
+# ── the message that sent a reader to re-map a checkout that never changed ────
+
+def _stuck_at(monkeypatch, url):
+    """A world where screen 2 offers neither 'Continuar' nor 'Comprar agora'."""
+    steps = {"n": 0}
+
+    class _P:
+        def __init__(self): self.url = url
+        def wait_for_timeout(self, ms): pass
+        def screenshot(self, **kw): pass
+
+    page = _P()
+
+    def _fv(p, text, limit=12):
+        if text == "Continuar":
+            steps["n"] += 1
+            return _Btn() if steps["n"] == 1 else None
+        return None
+    monkeypatch.setattr(checkout, "settle", lambda pg, **k: [_el("x")])
+    monkeypatch.setattr(checkout, "_actionable", lambda e: True)
+    monkeypatch.setattr(checkout, "_select_pix", lambda pg: False)
+    monkeypatch.setattr(checkout, "fill_known_fields", lambda pg, person: [])
+    monkeypatch.setattr(checkout, "_first_visible", _fv)
+    monkeypatch.setattr(checkout, "_await_transition", lambda pg, b, **k: True)
+    return page
+
+
+class _Btn:
+    clicks = 0
+    def click(self, **kw): type(self).clicks += 1
+
+
+def test_a_bounce_says_the_LISTING_went_not_the_flow(monkeypatch):
+    """⛔🔴 Reproduced live 2026-09-11, three times, on one stale 13/09 row: the app
+    bounced to /datas/ at screen 2 and the tool said "the flow changed; re-run `map`".
+    The flow was fine. Re-mapping a checkout that never changed costs an hour and finds
+    nothing — the row had simply been sold between the resolve and that screen."""
+    page = _stuck_at(monkeypatch,
+                     "https://buyticketbrasil.com/datas/rockinrio2026?anuncio=x&p=2")
+    with pytest.raises(checkout.CheckoutError) as ei:
+        checkout.run_checkout(page, None, dry_run=True, expect_cents=None)
+    msg = str(ei.value)
+    assert "listing evaporated" in msg
+    assert "do NOT re-run `map`" in msg
+
+
+def test_a_stall_INSIDE_the_checkout_still_says_re_map(monkeypatch):
+    """⛔ The other arm must survive: still on /checkout means the controls really did
+    change, and that IS a re-map. Collapsing the two diagnoses back together would just
+    move the misleading message to the other case."""
+    page = _stuck_at(monkeypatch,
+                     "https://buyticketbrasil.com/checkout?anuncio=x&p=2")
+    with pytest.raises(checkout.CheckoutError) as ei:
+        checkout.run_checkout(page, None, dry_run=True, expect_cents=None)
+    msg = str(ei.value)
+    assert "re-run `map`" in msg
+    assert "listing evaporated" not in msg
+
+
+@pytest.mark.parametrize("deadline,shown", [(0.5, "0.5s"), (45.0, "45s"), (16.5, "16.5s")])
+def test_a_sub_second_budget_is_not_printed_as_zero(monkeypatch, deadline, shown):
+    """⚠️ Observed live: a 0.5 s deadline printed 'over the 0s exposure budget', which
+    reads as a misconfiguration rather than the value that was asked for."""
+    page, _ = _reaches_the_order(monkeypatch)
+    with pytest.raises(BudgetExceeded) as ei:
+        checkout.run_checkout(page, None, dry_run=True, expect_cents=13200,
+                              clock=_Clock(900.0), deadline_s=deadline)
+    assert shown in str(ei.value)
+
+
+def test_a_rehearsal_prints_whether_it_would_have_clicked(tmp_path, monkeypatch, capsys):
+    """⭐ Exercising this live showed the dry run reporting a raw `walk_s` inside a dict
+    and no verdict — the reader had to do the comparison the gate had just done."""
+    t = tmp_path / "t.json"
+    t.write_text(json.dumps({
+        "id": "n", "label": "N",
+        "params": {"event_slug": "e", "data_millis": 1, "evento_local": "l"},
+        "buy": {"enabled": True, "max_price_brl": 500.0, "quantity": 1,
+                "sector": ["Gramado"], "entry_class": None}}), encoding="utf-8")
+    monkeypatch.setattr(buy_mod, "_execute_buy",
+                        lambda cfg, **kw: (None, {"dry_run": True, "walk_s": 16.94}))
+    args = SimpleNamespace(target=str(t), fields="f", headed=False,
+                           dry_run=True, deadline=17.0)
+    assert buy_mod.cmd_buy(args) == 0
+    out = capsys.readouterr().out
+    assert "would have CLICKED" in out and "16.94s" in out
+
+    args.deadline = 16.0
+    buy_mod.cmd_buy(args)
+    assert "would have REFUSED" in capsys.readouterr().out
+
+
+def test_a_rehearsal_with_no_deadline_prints_no_verdict(tmp_path, monkeypatch, capsys):
+    """⛔ A verdict against a budget nobody set is the decorative kind."""
+    t = tmp_path / "t.json"
+    t.write_text(json.dumps({
+        "id": "n", "label": "N",
+        "params": {"event_slug": "e", "data_millis": 1, "evento_local": "l"},
+        "buy": {"enabled": True, "max_price_brl": 500.0, "quantity": 1,
+                "sector": ["Gramado"], "entry_class": None}}), encoding="utf-8")
+    monkeypatch.setattr(buy_mod, "_execute_buy",
+                        lambda cfg, **kw: (None, {"dry_run": True, "walk_s": 16.94}))
+    buy_mod.cmd_buy(SimpleNamespace(target=str(t), fields="f", headed=False,
+                                    dry_run=True, deadline=None))
+    assert "rehearsed" not in capsys.readouterr().out
