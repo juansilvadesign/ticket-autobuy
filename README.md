@@ -1,5 +1,16 @@
 # ticket-autobuy
 
+<p align="center">
+  <img src="assets/showcase/price-watcher-ticket-autobuy-showcase.webp"
+       alt="price-watcher and ticket-autobuy: a ticket page showing one price opens to reveal the nineteen in its payload, the watcher fires a new-lowest alert to Telegram, a vertical line divides the two tools with the one config key that crosses it, the buyer walks a checkout to a completed order, and the counts settle at 424 tests, 7 nights and 1 real order"
+       width="100%">
+</p>
+
+*One reel, two repos.* [`price-watcher`](../price-watcher/) watches and **cannot buy**; `ticket-autobuy`
+holds the browser and reserves. The only thing that crosses the line between them is a `buy`
+block in a target file that the watcher parses and ignores. Source composition:
+[`juansilva.design/motion/price-watcher-ticket-autobuy-showcase`](https://github.com/juansilvadesign/juansilva.design).
+
 Reserves a [BuyTicket](https://buyticketbrasil.com) listing when it drops under a price
 you set, and sends you the **Pix code to pay**. It never pays — the **~10-minute** hold on
 an unpaid Pix is the human gate. (Measured on order #7707X57Q: the checkout says *"Você
@@ -20,9 +31,9 @@ buys. See [`CLAUDE.md`](CLAUDE.md) for why that split is load-bearing, and
 | checkout flow, all 5 screens | ✅ mapped live |
 | `buy --dry-run` (drives everything, stops 1 click short) | ✅ **passes end to end** |
 | headless | ✅ verified, and *faster* than headed |
-| the final click + reading the Pix code | 🔲 unverified — needs one real purchase |
+| the final click + reading the Pix code | ✅ **proven end to end** 2026-09-11 (order `6731D321`, Pix in 5.49s) |
 
-114 tests green.
+196 tests green.
 
 ## Install
 
@@ -81,7 +92,15 @@ the hold lapse.
 
 Fires once per night when the market dips under that target's `buy.max_price_brl`.
 
-### 🎯 Current plan — 11/09 ONLY, on a rising ladder (Juan, 2026-09-06)
+### ⏹️ CLOSED 2026-09-11 — kept below as the record of how it was run
+
+⛔ **Nothing is armed and nothing is scheduled.** The crontab has **zero active job lines**,
+all eight targets are `enabled: false` / `buy.enabled: false`, and the five dated `set_ceiling`
+/ `stop_night` lines below carry **past** dates — do not uncomment them to reuse. The section
+that follows is preserved because the ladder and its asymmetries are the interesting part, not
+because any of it is still running.
+
+### 🎯 The plan as it stood — 11/09 ONLY, on a rising ladder (Juan, 2026-09-06)
 
 04/09 and 05/09 were attended, both bought **by hand at over R$300** because the
 auto-buy never closed a purchase. Everything is now pointed at one night: **11/09
