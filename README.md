@@ -1,9 +1,13 @@
 # ticket-autobuy
 
 <p align="center">
-  <img src="assets/showcase/price-watcher-ticket-autobuy-showcase.webp"
-       alt="price-watcher and ticket-autobuy: a ticket page showing one price opens to reveal the nineteen in its payload, the watcher fires a new-lowest alert to Telegram, a vertical line divides the two tools with the one config key that crosses it, the buyer walks a checkout to a completed order, and the counts settle at 424 tests, 7 nights and 1 real order"
-       width="100%">
+  <picture>
+    <source media="(prefers-color-scheme: dark)"  srcset="assets/showcase/price-watcher-ticket-autobuy-showcase-dark.webp">
+    <source media="(prefers-color-scheme: light)" srcset="assets/showcase/price-watcher-ticket-autobuy-showcase-light.webp">
+    <img src="assets/showcase/price-watcher-ticket-autobuy-showcase-light.webp"
+         alt="price-watcher and ticket-autobuy: the shared mark resolves into a browser tab, a listing page showing one price opens a payload drawer holding nineteen lots, watch.py streams its polls beside the target file's buy block, a Telegram alert lands stamped ALWAYS PRECISE, two cards face each other across the one config key that crosses between them, a checkout stepper walks to a reserved order left for you to approve, and the counts settle at 424 tests, 7 nights and 1 real order"
+         width="100%">
+  </picture>
 </p>
 
 *One reel, two repos.* [`price-watcher`](../price-watcher/) watches and **cannot buy**; `ticket-autobuy`
